@@ -3,9 +3,12 @@ set -exo pipefail
 
 # CANN toolkit is installed outside conda (driver + toolkit from the Ascend
 # installers); this only sources its environment.
-eval "$(conda shell.bash hook)"
-export CONDA_ENV="${CONDA_ENV:-raven-npu}"
-conda activate "$CONDA_ENV"
+# conda is optional: without it the venv is built from the python on PATH.
+if command -v conda >/dev/null 2>&1; then
+    eval "$(conda shell.bash hook)"
+    export CONDA_ENV="${CONDA_ENV:-raven-npu}"
+    conda activate "$CONDA_ENV"
+fi
 
 if [ -z "${ASCEND_SET_ENV}" ]; then
     for candidate in /usr/local/Ascend/ascend-toolkit/set_env.sh /usr/local/Ascend/cann/set_env.sh; do

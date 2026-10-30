@@ -8,14 +8,20 @@ else
     DEVICE=cuda
 fi
 
-eval "$(conda shell.bash hook)"
-if [ "$DEVICE" = npu ]; then
-    export CONDA_ENV="${CONDA_ENV:-raven-npu}"
-else
-    export CONDA_ENV="${CONDA_ENV:-raven}"
+# Activate the conda env and the repo venv when present; otherwise run in the
+# Python environment that is already active (e.g. an Ascend container image).
+if command -v conda >/dev/null 2>&1; then
+    eval "$(conda shell.bash hook)"
+    if [ "$DEVICE" = npu ]; then
+        export CONDA_ENV="${CONDA_ENV:-raven-npu}"
+    else
+        export CONDA_ENV="${CONDA_ENV:-raven}"
+    fi
+    conda activate "$CONDA_ENV"
 fi
-conda activate "$CONDA_ENV"
-source "venv/bin/activate"
+if [ -f venv/bin/activate ]; then
+    source "venv/bin/activate"
+fi
 
 if [ "$DEVICE" = npu ]; then
     if [ -z "${ASCEND_SET_ENV}" ]; then
@@ -25,6 +31,8 @@ if [ "$DEVICE" = npu ]; then
     fi
     [ -n "${ASCEND_SET_ENV}" ] || { echo "CANN set_env.sh not found; export ASCEND_SET_ENV=/path/to/set_env.sh" >&2; exit 1; }
     source "$ASCEND_SET_ENV"
+    # Without torch_npu the launcher would quietly fall back to CPU.
+    python -c "import torch_npu" || { echo "torch_npu is not importable from $(command -v python); activate the environment that has it" >&2; exit 1; }
 
     # torch's count, not npu-smi's: it honours ASCEND_RT_VISIBLE_DEVICES and
     # counts both dies of a dual-die card.
