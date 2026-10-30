@@ -48,6 +48,10 @@ natively, then ``to_empty`` materializes each rank's shard).
                                       # explicit null on either dtype = follow
                                       # the parameters' own dtype (torch raw)
 
+    placement:
+      fsdp: null                      # same as no fsdp node: lets a trial that
+                                      # inherits an fsdp placement turn it off
+
 ``device`` and ``fsdp`` are mutually exclusive: the fsdp path derives the
 device from ``LOCAL_RANK``, so a configured ``device`` would be silently
 ignored.
@@ -252,7 +256,10 @@ class DefaultPlacement:
         if not isinstance(model, torch.nn.Module):
             return state
 
-        assert not ("device" in self.config and "fsdp" in self.config), (
+        # An explicit ``fsdp: null`` counts as absent: config inheritance can
+        # override a key but not delete it.
+        fsdp = self.config.get("fsdp")
+        assert not ("device" in self.config and fsdp is not None), (
             "placement.device and placement.fsdp are mutually exclusive: the fsdp path derives the "
             "device from LOCAL_RANK, so a configured device would be silently ignored"
         )
@@ -268,8 +275,8 @@ class DefaultPlacement:
         weight_dtype = getattr(torch, self.config.weight_dtype) if "weight_dtype" in self.config else None
 
         # fsdp shards the model; otherwise move wholesale to device, casting trainable params.
-        if "fsdp" in self.config:
-            state["model"] = self._shard(state["model"], self.config.fsdp, state["name"], trainable, weight_dtype)
+        if fsdp is not None:
+            state["model"] = self._shard(state["model"], fsdp, state["name"], trainable, weight_dtype)
         else:
             device = torch.device(self.config["device"]) if "device" in self.config else ops.get_device()
             model = state["model"].to(device)

@@ -1,0 +1,15 @@
+# NPU port, step 4a on an Ascend 950 (128 GiB HBM per card): the DiT without FSDP.
+#
+# Same as npu_4a_single_card except that the 33.1B DiT (~66 GB in bf16) is
+# moved onto the card wholesale, so its whole forward runs with no FSDP and no
+# collective at all. The Qwen3-VL-32B text encoder cannot join it (another
+# ~66 GB), so it keeps FSDP on a 1-rank mesh for CPU offload; it runs once per
+# prompt, before the rollout.
+#
+#   ASCEND_RT_VISIBLE_DEVICES=0 N=1 bash tools/multi_run.sh projects/minimax_h3/trials/npu/npu_4a_single_card_950.yaml
+__inherit__: npu_4a_single_card.yaml
+
+models:
+  backbone:
+    placement:
+      fsdp: null
