@@ -1,0 +1,26 @@
+# NPU port, step 4b: FSDP2 across 8 cards, no sequence parallelism.
+#
+# Same as the preview trial except that Ulysses SP is off, so the first
+# multi-rank run isolates fully_shard + CPUOffloadPolicy + HCCL all-gathers
+# from SP's all-to-all (step 4c turns SP back on with the original trial).
+# Each rank rolls out its own prompt; 4 prompts over 8 ranks means 4 ranks
+# repeat the last one without saving it, which keeps every rank's FSDP
+# collectives in lockstep.
+#
+# Spatial size is halved (384x672) because without SP every rank carries the
+# whole sequence; restore the full size with
+#   validation.height 768 validation.width 1376
+# appended to the command once this passes.
+#
+#   N=8 bash tools/multi_run.sh projects/minimax_h3/trials/npu/npu_4b_fsdp8_no_sp.yaml
+__inherit__: projects/minimax_h3/trials/base/causal_minimax_h3_base/minimax_h3_raven_streaming_lora_4nfe_preview.yaml
+
+validation:
+  height: 384
+  width: 672
+
+engine:
+  up_size: null
+
+distributed:
+  up_size: null

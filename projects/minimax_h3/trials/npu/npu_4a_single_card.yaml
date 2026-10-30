@@ -1,0 +1,35 @@
+# NPU port, step 4a: one card, no sequence parallelism.
+#
+# Checks model build, weight load, the LoRA adapter, VAE decode and the HCCL
+# bring-up on a single rank. The 33.1B DiT and the Qwen3-VL-32B text encoder
+# are ~66 GB each in bf16 and do not fit one 64 GB card, so they keep FSDP on a
+# 1-rank mesh purely for its CPU offload: weights stay in host RAM and stream to
+# the card one wrap unit at a time. Both VAEs are placed on the card directly.
+#
+# Spatial size is halved (384x672) to keep the run short; the frame count stays
+# at 192 so the chunk / KV-cache structure matches the production trial.
+#
+#   ASCEND_RT_VISIBLE_DEVICES=0 N=1 bash tools/multi_run.sh projects/minimax_h3/trials/npu/npu_4a_single_card.yaml
+__inherit__: projects/minimax_h3/trials/base/causal_minimax_h3_base/minimax_h3_raven_streaming_lora_4nfe_preview.yaml
+
+validation:
+  num_prompts: 1
+  nrow: 1
+  height: 384
+  width: 672
+
+engine:
+  up_size: null
+
+distributed:
+  up_size: null
+
+models:
+  backbone:
+    placement:
+      fsdp:
+        shard_size: 1
+  text_encoder:
+    placement:
+      fsdp:
+        shard_size: 1
