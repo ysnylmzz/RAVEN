@@ -182,7 +182,9 @@ class RotaryEmbeddingND(nn.Module):
         if D != self.n_dim:
             raise ValueError(f"Expected {self.n_dim} dimensions, got {D}")
 
-        with torch.autocast("cuda", enabled=False):
+        # fp32 island: must name the tensor's own device type, or an enclosing
+        # NPU/CPU autocast stays active inside it.
+        with torch.autocast(img_ids.device.type, enabled=False):
             angles = (
                 self.angle_scale
                 * img_ids[:, :, :, None]

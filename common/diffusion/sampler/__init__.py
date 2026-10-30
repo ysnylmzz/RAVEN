@@ -7,6 +7,7 @@ from typing import List, Tuple, Union
 
 import torch
 
+from ...distributed.ops import get_device_type
 from ...seed import RandomState
 from ..schedule import BaseSchedule
 
@@ -31,7 +32,7 @@ class BaseSampler(ABC):
     def autocast(self) -> torch.autocast:
         """Autocast context for sampler math, honoring the ``autocast`` config node."""
         return torch.autocast(
-            device_type="cuda",
+            device_type=get_device_type(),
             dtype=getattr(torch, self._autocast.get("dtype", "bfloat16")),
             enabled=self._autocast.get("enabled", False),
             cache_enabled=self._autocast.get("cache_enabled", True),

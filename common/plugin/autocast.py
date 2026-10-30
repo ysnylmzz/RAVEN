@@ -17,6 +17,7 @@ from typing import Any
 
 import torch
 
+from ..distributed import ops
 from ..model.runtime import RuntimePlugin
 
 
@@ -38,9 +39,11 @@ class AutocastNoGradWrapper(RuntimePlugin):
                 if not grad_enabled:
                     stack.enter_context(torch.no_grad())
                 if autocast.get("enabled", False):
+                    # Keyed to the active accelerator: autocast for any other
+                    # device type is a silent no-op on this one.
                     stack.enter_context(
                         torch.autocast(
-                            "cuda",
+                            ops.get_device_type(),
                             dtype=getattr(torch, autocast.get("dtype", "bfloat16")),
                             cache_enabled=autocast.get("cache_enabled", True),
                         )

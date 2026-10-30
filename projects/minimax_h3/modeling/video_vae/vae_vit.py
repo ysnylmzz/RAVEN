@@ -272,7 +272,9 @@ class ViT3DDecoder(ViTBase):
         hidden_states = _pack_tensors_3d(x, 1, 1)
         latent_size = (latent_T, latent_H, latent_W)
 
-        with torch.autocast("cuda", enabled=False):
+        # fp32 islands below name the input's device type: disabling autocast
+        # for any other device leaves the enclosing NPU/CPU autocast active.
+        with torch.autocast(x.device.type, enabled=False):
             hidden_states = _linear_with_module_dtype(
                 self.x_embedder, hidden_states, hidden_states.dtype
             )
@@ -291,8 +293,8 @@ class ViT3DDecoder(ViTBase):
 
         patch_dims = [latent_T, latent_H, latent_W]
         rotary_dtype = (
-            torch.get_autocast_dtype("cuda")
-            if x.is_cuda and torch.is_autocast_enabled("cuda")
+            torch.get_autocast_dtype(x.device.type)
+            if torch.is_autocast_enabled(x.device.type)
             else hidden_states.dtype
         )
         cache_enabled = (
@@ -357,7 +359,7 @@ class ViT3DDecoder(ViTBase):
 
         hidden_states = self.apply_mask_postprocess(hidden_states, num_patches)
 
-        with torch.autocast("cuda", enabled=False):
+        with torch.autocast(x.device.type, enabled=False):
             output = _linear_with_module_dtype(
                 self.proj_out, hidden_states, hidden_states.dtype
             )
