@@ -202,8 +202,8 @@ class CausalMiniMaxH3TSCD(CausalMiniMaxH3TF):
         # only ever enters schedule.forward and is never fed to a model; it just
         # sets how noisy the two modalities' comparison points are relative to
         # each other. _generator rather than lerp_random's bare
-        # torch_cuda_generator: that one is None without CUDA and would fall
-        # back to the global stream, breaking resume.
+        # torch_device_generator: that one is None on CPU-only runs and would
+        # fall back to the global stream, breaking resume.
         weight = 1.0 - torch.rand(
             (sum(chunk_counts),), device=device, generator=self._generator(rng)
         )

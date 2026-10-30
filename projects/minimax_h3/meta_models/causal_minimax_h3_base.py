@@ -1907,12 +1907,12 @@ class CausalMiniMaxH3Base:
     def _generator(rng: Any) -> torch.Generator:
         """The rng's generator for the current device.
 
-        ``RandomState.torch_cuda_generator`` is None without CUDA, and
+        ``RandomState.torch_device_generator`` is None on CPU-only runs, and
         ``normal_(generator=None)`` would silently fall back to the global
         stream and break resume determinism.
         """
         device = get_device()
-        return rng.torch_cuda_generator if device.type == "cuda" else rng.torch_generator
+        return rng.torch_device_generator if device.type != "cpu" else rng.torch_generator
 
     @staticmethod
     def _sample_paired_timesteps(

@@ -26,22 +26,24 @@ import random
 import numpy as np
 import torch
 
+from .distributed import ops
 from .logging import get_logger
 
 logger = get_logger()
 
 
 def seed_everything(seed: int) -> None:
-    """Seed the python, numpy, torch-CPU and torch-CUDA global RNGs.
+    """Seed the python, numpy, torch-CPU and torch-device (CUDA/NPU) global RNGs.
 
     ``manual_seed_all`` covers every device generator of this process, so the
-    call order relative to ``torch.cuda.set_device`` does not matter.
+    call order relative to ``set_device`` does not matter.
     """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    device_module = ops.get_device_module()
+    if device_module is not None:
+        device_module.manual_seed_all(seed)
     logger.info("Global RNGs seeded: %d", seed)
 
 
@@ -73,7 +75,12 @@ class RandomState:
 
     Generators are the non-global alternative for everything after the build:
     pass ``python_generator`` / ``numpy_generator`` / ``torch_generator`` /
-    ``torch_cuda_generator`` explicitly instead of touching global RNG state.
+    ``torch_device_generator`` explicitly instead of touching global RNG state.
+    ``torch_device_generator`` lives on the current accelerator (CUDA or NPU)
+    and is ``None`` on CPU-only runs.
+
+    Device streams are not bit-identical across backends: the same seed draws
+    different noise on NPU than on CUDA.
     """
 
     def __init__(self, seed: int):
@@ -81,10 +88,9 @@ class RandomState:
         self.python_generator = random.Random(seed)
         self.numpy_generator = np.random.default_rng(seed)
         self.torch_generator = torch.Generator().manual_seed(seed)
-        self.torch_cuda_generator = (
-            torch.Generator(device=torch.device("cuda", torch.cuda.current_device())).manual_seed(seed)
-            if torch.cuda.is_available()
-            else None
+        device = ops.get_device()
+        self.torch_device_generator = (
+            torch.Generator(device=device).manual_seed(seed) if device.type != "cpu" else None
         )
 
     def fork(self, *components) -> "RandomState":
@@ -101,26 +107,27 @@ class RandomState:
 def local_seed(seed: int | None):
     """Seed the global RNGs inside the context, restore previous states on exit.
 
-    ``None`` is a no-op passthrough. CUDA state is saved/restored for the
-    current device only (one process drives one device in this framework).
+    ``None`` is a no-op passthrough. Device (CUDA/NPU) state is saved/restored
+    for the current device only (one process drives one device in this framework).
     """
     if seed is None:
         yield
         return
+    device_module = ops.get_device_module()
     python_state = random.getstate()
     numpy_state = np.random.get_state()
     torch_state = torch.get_rng_state()
-    cuda_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+    device_state = device_module.get_rng_state() if device_module is not None else None
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
+    if device_module is not None:
+        device_module.manual_seed(seed)
     try:
         yield
     finally:
         random.setstate(python_state)
         np.random.set_state(numpy_state)
         torch.set_rng_state(torch_state)
-        if cuda_state is not None:
-            torch.cuda.set_rng_state(cuda_state)
+        if device_state is not None:
+            device_module.set_rng_state(device_state)

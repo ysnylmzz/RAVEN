@@ -303,10 +303,11 @@ class BaseEngine:
         iters_since_log = max((self.iter + 1) - self._last_log_iter, 1)
         means["timer/iter"] = (time.perf_counter() - step_timer) / iters_since_log
         self._last_log_iter = self.iter + 1
-        if torch.cuda.is_available():
-            memory_free, memory_total = torch.cuda.mem_get_info()
+        device_module = ops.get_device_module()
+        if device_module is not None:
+            memory_free, memory_total = device_module.mem_get_info()
             means["memory/used_gb"] = (memory_total - memory_free) / (1024**3)
-            means["memory/alloc_retries"] = torch.cuda.memory_stats()["num_alloc_retries"]
+            means["memory/alloc_retries"] = device_module.memory_stats().get("num_alloc_retries", 0)
         get_logger().log_metrics(means, step=optimizer_step)
 
         # Two-column metric table, folded side by side to keep it compact.

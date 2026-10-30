@@ -26,6 +26,7 @@ from torch.distributed.checkpoint.state_dict import (
     set_optimizer_state_dict,
 )
 
+from .distributed import ops
 from .logging import get_logger
 
 logger = get_logger()
@@ -319,8 +320,11 @@ class RngStateHandler:
             "numpy": np.random.get_state(),
             "torch_cpu": torch.get_rng_state(),
         }
-        if torch.cuda.is_available():
-            payload["torch_cuda"] = torch.cuda.get_rng_state_all()
+        # Keyed by device type: a CUDA RNG state must never be restored into an
+        # NPU generator (or vice versa) when a run resumes on other hardware.
+        device_module = ops.get_device_module()
+        if device_module is not None:
+            payload[f"torch_{ops.get_device_type()}"] = device_module.get_rng_state_all()
         return {f"rank_{rank}": pickle.dumps(payload)}
 
     def load_state_dict(self, sd: Any) -> None:
@@ -330,8 +334,10 @@ class RngStateHandler:
         random.setstate(payload["python"])
         np.random.set_state(payload["numpy"])
         torch.set_rng_state(payload["torch_cpu"])
-        if "torch_cuda" in payload and torch.cuda.is_available():
-            torch.cuda.set_rng_state_all(payload["torch_cuda"])
+        device_module = ops.get_device_module()
+        device_key = f"torch_{ops.get_device_type()}"
+        if device_key in payload and device_module is not None:
+            device_module.set_rng_state_all(payload[device_key])
 
 
 def walk_state_tree(tree: dict, overrides: dict) -> dict[str, Any]:
@@ -398,7 +404,7 @@ class Checkpointer:
         """Dedicated gloo group for async saves (torchtitan pattern).
 
         The async writer coordinates its plan/metadata exchange from a background
-        thread; that must never share the training (NCCL) process group. Created
+        thread; that must never share the training (NCCL/HCCL) process group. Created
         eagerly at construction time -- before any training collective is in
         flight -- and warmed up with one barrier so gloo's lazy TCP connect does
         not happen inside the first save.
@@ -430,12 +436,14 @@ class Checkpointer:
         if self.async_mode:
             if dist.is_available() and dist.is_initialized() and self._async_pg is None:
                 # dist was not yet initialized when this Checkpointer was built,
-                # so the group is created mid-training: drain in-flight NCCL work
+                # so the group is created mid-training: drain in-flight NCCL/HCCL work
                 # and align all ranks on the default pg first (new_group "Safe
                 # concurrent usage": pending async ops on one pg must complete
                 # before another pg is used, and all ranks must create groups in
                 # the same order).
-                torch.cuda.synchronize()
+                device_module = ops.get_device_module()
+                if device_module is not None:
+                    device_module.synchronize()
                 dist.barrier()
                 self._async_pg = self._create_async_pg()
             future = dcp.async_save(entries, checkpoint_id=str(checkpoint_dir), process_group=self._async_pg)

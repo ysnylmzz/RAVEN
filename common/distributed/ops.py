@@ -97,11 +97,51 @@ def all_gather(tensor: torch.Tensor, group: dist.ProcessGroup | None = None) -> 
     return gathered
 
 
-def get_device() -> torch.device:
-    """The current CUDA device when available, else CPU (single-process/tests)."""
+_DIST_BACKENDS = {"cuda": "nccl", "npu": "hccl"}
+
+
+def get_device_type() -> str:
+    """The accelerator this process drives: ``"npu"`` (Ascend), ``"cuda"`` or ``"cpu"``.
+
+    ``torch.npu`` only exists once ``torch_npu`` is imported (``common.launch``
+    does it first; torch's device-backend autoload covers other entry points).
+    """
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        return "npu"
     if torch.cuda.is_available():
-        return torch.device("cuda", torch.cuda.current_device())
-    return torch.device("cpu")
+        return "cuda"
+    return "cpu"
+
+
+def get_device_module():
+    """``torch.npu`` / ``torch.cuda`` for the active accelerator, ``None`` on CPU.
+
+    Both expose the same surface (``set_device``, ``current_device``,
+    ``manual_seed_all``, ``get_rng_state``, ``synchronize``, memory stats), so
+    callers write one code path against this instead of ``torch.cuda``.
+    """
+    device_type = get_device_type()
+    return None if device_type == "cpu" else torch.get_device_module(device_type)
+
+
+def get_device() -> torch.device:
+    """The current accelerator device when available, else CPU (single-process/tests)."""
+    device_module = get_device_module()
+    if device_module is None:
+        return torch.device("cpu")
+    return torch.device(get_device_type(), device_module.current_device())
+
+
+def get_process_group_backend() -> str:
+    """Composite backend for process groups: Gloo for CPU tensors, the accelerator's collective library otherwise.
+
+    ``cpu:gloo,cuda:nccl`` on CUDA, ``cpu:gloo,npu:hccl`` on Ascend, plain
+    ``gloo`` on CPU-only runs.
+    """
+    device_type = get_device_type()
+    if device_type == "cpu":
+        return "gloo"
+    return f"cpu:gloo,{device_type}:{_DIST_BACKENDS[device_type]}"
 
 
 def to_device(data, device: torch.device):

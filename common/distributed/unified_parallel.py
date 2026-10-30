@@ -18,6 +18,8 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
+from .ops import get_device
+
 
 @dataclass(frozen=True)
 class UnifiedParallelTopology:
@@ -338,7 +340,7 @@ class Slice(torch.autograd.Function):
         dim_size = list(grad_output.size())
         split_size = dim_size[0]
         dim_size[0] = dim_size[0] * ctx.seq_world_size
-        output = torch.empty(dim_size, dtype=grad_output.dtype, device=torch.cuda.current_device())
+        output = torch.empty(dim_size, dtype=grad_output.dtype, device=get_device())
         dist.all_gather_into_tensor(output, grad_output.contiguous(), group=ctx.group)
         if ctx.scale_grad:
             output = output / ctx.seq_world_size
@@ -364,7 +366,7 @@ class Gather(torch.autograd.Function):
         split_size = dim_size[0]
         ctx.part_size = dim_size[dim]
         dim_size[0] = dim_size[0] * seq_world_size
-        output = torch.empty(dim_size, dtype=local_input.dtype, device=torch.cuda.current_device())
+        output = torch.empty(dim_size, dtype=local_input.dtype, device=get_device())
         dist.all_gather_into_tensor(output, local_input.contiguous(), group=ctx.group)
         return torch.cat(output.split(split_size), dim=dim)
 
@@ -935,7 +937,7 @@ class SPDistForward:
         if device:
             self.device = device
         else:
-            self.device = torch.cuda.current_device()
+            self.device = get_device()
 
     def _has_tensor(self, data):
         if isinstance(data, (list, tuple)):

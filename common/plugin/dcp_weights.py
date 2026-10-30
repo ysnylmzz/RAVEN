@@ -324,7 +324,7 @@ class ShardedDCPWeights(PlacementPlugin):
         placement = state["config"].get("placement", None)
         fsdp = placement.get("fsdp", None) if placement else None
         offloaded = bool(fsdp.get("cpu_offload", False)) if fsdp else False
-        compute = torch.device("cuda", ops.get_local_rank())
+        compute = torch.device(ops.get_device_type(), ops.get_local_rank())
         device = torch.device("cpu") if offloaded else compute
 
         # Inspect FQNs and meta state before materialization. Selectively allowed

@@ -122,7 +122,7 @@ class BaseSamplingTimesteps(BaseTimesteps):
         """
         bsz = len(min_t)
         diff_t = max_t - min_t
-        timepoints = 1. - torch.rand((bsz,), device=get_device(), generator=rng.torch_cuda_generator)  # (0,1]
+        timepoints = 1. - torch.rand((bsz,), device=get_device(), generator=rng.torch_device_generator)  # (0,1]
         timesteps = min_t + timepoints * diff_t
         if not self.is_continuous():
             timesteps = timesteps.round().long()

@@ -84,11 +84,11 @@ class TCDSampler(BaseSampler):
                 bsz = pred.shape[0]
                 assert len(rng) == bsz
                 noises = torch.stack([
-                    torch.randn(size=pred_x_0.shape[1:], device=pred_x_0.device, generator=rng[i].torch_cuda_generator)
+                    torch.randn(size=pred_x_0.shape[1:], device=pred_x_0.device, generator=rng[i].torch_device_generator)
                     for i in range(bsz)
                 ])
             else:
-                noises = torch.randn(size=pred_x_0.shape, device=pred_x_0.device, generator=rng.torch_cuda_generator)
+                noises = torch.randn(size=pred_x_0.shape, device=pred_x_0.device, generator=rng.torch_device_generator)
             pred_x_s = self.schedule.forward_from_prev(pred_x_e, noises, t=s, s=e).to(x_t.dtype)
         return pred_x_s
 

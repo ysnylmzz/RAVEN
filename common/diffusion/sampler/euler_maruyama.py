@@ -178,7 +178,7 @@ class EulerMaruyamaSampler(BaseSampler):
                     torch.randn(
                         size=mean.shape[1:],
                         device=mean.device,
-                        generator=rng[i].torch_cuda_generator,
+                        generator=rng[i].torch_device_generator,
                     )
                     for i in range(bsz)
                 ])
@@ -186,7 +186,7 @@ class EulerMaruyamaSampler(BaseSampler):
                 noises = torch.randn(
                     size=mean.shape,
                     device=mean.device,
-                    generator=rng.torch_cuda_generator,
+                    generator=rng.torch_device_generator,
                 )
             x_s = mean + std * noises
         return x_s.to(x_t.dtype)

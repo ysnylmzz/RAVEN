@@ -174,7 +174,7 @@ class CausalWanT2VDMD(CausalWanT2V):
         # sample_noises — RAVEN: base_meta_model.py:315-324. Per-sample randn from
         # rng BEFORE infer; infer's internal draws follow (exact rng stream order).
         sampling_noises = [
-            torch.empty_like(latent).normal_(generator=rng.torch_cuda_generator)
+            torch.empty_like(latent).normal_(generator=rng.torch_device_generator)
             for latent in bwd_pos.latents
         ]
         bwd_pos.noises = sampling_noises
@@ -213,7 +213,7 @@ class CausalWanT2VDMD(CausalWanT2V):
         fake_inputs.latents = latent_x0s  # set_latents (base_meta_model.py:266-272)
         # draw 2 — sample_noises (base_meta_model.py:315-324)
         fake_noises = [
-            torch.empty_like(latent).normal_(generator=rng.torch_cuda_generator)
+            torch.empty_like(latent).normal_(generator=rng.torch_device_generator)
             for latent in fake_inputs.latents
         ]
         fake_inputs.noises = fake_noises

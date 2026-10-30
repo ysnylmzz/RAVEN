@@ -16,13 +16,14 @@ dictated by how the core placement op treats meta tensors:
   from global RNG). The core ``.to(device)`` then moves the real, initialized model.
 * ``ShardedInitWeights`` -- fsdp, ``after_placement``. ``fully_shard`` shards meta
   tensors natively, so the core runs first and leaves meta DTensor shards; this
-  then materializes each rank's shard on cuda and initializes. DTensor's RNG must
-  be driven by the default generator seeded identically on every rank (an explicit
-  generator triggers DTensor's deprecated rank0 RNG-sync), so the init runs inside
-  ``local_seed`` -- which seeds the global RNGs and restores every previous state
-  (python/numpy/torch-CPU/torch-CUDA) on exit, leaving the build-time global RNG
-  undisturbed for any later design that relies on it. FSDP-path correctness is
-  verified on the cluster, not locally (DTensor RNG is CUDA-only).
+  then materializes each rank's shard on the device (CUDA/NPU) and initializes.
+  DTensor's RNG must be driven by the default generator seeded identically on every
+  rank (an explicit generator triggers DTensor's deprecated rank0 RNG-sync), so the
+  init runs inside ``local_seed`` -- which seeds the global RNGs and restores every
+  previous state (python/numpy/torch-CPU/torch-device) on exit, leaving the
+  build-time global RNG undisturbed for any later design that relies on it.
+  FSDP-path correctness is verified on the cluster, not locally (DTensor RNG needs
+  an accelerator).
 
 Both preserve buffers: instantiation uses ``init_empty_weights``, which leaves
 buffers materialized (only parameters go to meta), so the constructor's buffer
@@ -117,13 +118,13 @@ class InitWeights(PlacementPlugin):
 
 class ShardedInitWeights(PlacementPlugin):
     """FSDP from-scratch init: after ``fully_shard`` has produced meta DTensor
-    shards, materialize each rank's shard on cuda and init via DTensor's RNG."""
+    shards, materialize each rank's shard on the device and init via DTensor's RNG."""
 
     def after_placement(self, state: dict[str, Any]) -> dict[str, Any]:
         model = state["model"]
         if not isinstance(model, nn.Module) or not any(p.is_meta for p in model.parameters()):
             return state
-        device = torch.device("cuda", ops.get_local_rank())
+        device = torch.device(ops.get_device_type(), ops.get_local_rank())
         _materialize(model, device)
         # DTensor RNG: seed the default generator identically on every rank so
         # DTensor's dispatch draws per-shard-unique, reproducible values (an

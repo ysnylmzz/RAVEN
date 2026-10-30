@@ -11,6 +11,7 @@ import torch.distributed as dist
 
 from ..logging import get_logger
 from ..seed import seed_everything
+from . import ops
 
 logger = get_logger()
 
@@ -21,12 +22,16 @@ def configure_distributed(config: Any) -> Any:
     Only runs under a distributed launcher (torchrun sets WORLD_SIZE); plain
     single-process invocations skip initialization entirely.
 
+    The accelerator is CUDA or Ascend NPU (``ops.get_device_type``); everything
+    below says "device" for whichever one this process drives.
+
     Decisions baked in:
-    - bind the local CUDA device *before* creating the process group so NCCL
-      communicators attach to the right GPU;
-    - dual-backend default pg (``cpu:gloo,cuda:nccl``, the form recommended by
-      ``dcp.async_save``) so CPU collectives never ride the NCCL stream;
-    - ``device_id`` enables eager NCCL init and device-aware ``barrier()``;
+    - bind the local device *before* creating the process group so NCCL/HCCL
+      communicators attach to the right card;
+    - dual-backend default pg (``cpu:gloo,cuda:nccl`` / ``cpu:gloo,npu:hccl``,
+      the form recommended by ``dcp.async_save``) so CPU collectives never ride
+      the device collective stream;
+    - ``device_id`` enables eager communicator init and device-aware ``barrier()``;
     - initializing here -- before persistence builds the Checkpointer and
       before any training collective is in flight -- keeps later
       ``dist.new_group`` calls (e.g. the checkpointer's async gloo group) out
@@ -34,27 +39,37 @@ def configure_distributed(config: Any) -> Any:
 
     Environment knobs (config node ``distributed``): ``timeout_minutes`` (30),
     ``cudnn_benchmark`` (false), ``deterministic`` (false; also pins the cuBLAS
-    workspace for reproducible GEMMs), ``cuda_alloc_conf``
-    (``expandable_segments:True``; curbs fragmentation under video workloads'
-    varying allocation sizes). Env vars use ``setdefault`` semantics -- an
-    external ``export`` wins. They only take effect because this function is
-    the first CUDA-touching code in the launch chain: torch reads the device
+    workspace for reproducible GEMMs and makes HCCL reductions deterministic),
+    ``alloc_conf`` (``expandable_segments:True``, exported as both
+    ``PYTORCH_CUDA_ALLOC_CONF`` and ``PYTORCH_NPU_ALLOC_CONF``; curbs
+    fragmentation under video workloads' varying allocation sizes). Env vars
+    use ``setdefault`` semantics -- an external ``export`` wins. They are set
+    for both backends *before* the device type is resolved, because resolving
+    it enumerates devices; they only take effect because this function is the
+    first device-touching code in the launch chain: torch reads the device
     order at first enumeration and the allocator config at first allocation,
     never at import.
     """
     dist_config = config.get("distributed", {})
-    # The env knobs below are read by torch/CUDA lazily (device order at first
-    # driver enumeration, allocator config at CUDA state init) -- they only
-    # work if nothing has touched CUDA yet. Heavy libraries are all imported
-    # lazily inside stage functions for exactly this reason; this assert fails
-    # loud if a future import regresses that discipline.
+    # The env knobs below are read by torch/CUDA/CANN lazily (device order at
+    # first driver enumeration, allocator config at device state init) -- they
+    # only work if nothing has touched the device yet. Heavy libraries are all
+    # imported lazily inside stage functions for exactly this reason; these
+    # asserts fail loud if a future import regresses that discipline. Unlike
+    # ops.get_device_type(), is_initialized() never enumerates devices.
     assert not torch.cuda.is_initialized(), "CUDA was initialized before configure_distributed; env knobs would be ignored"
+    assert not (hasattr(torch, "npu") and torch.npu.is_initialized()), (
+        "NPU was initialized before configure_distributed; env knobs would be ignored"
+    )
+    alloc_conf = dist_config.get("alloc_conf", "expandable_segments:True")
     os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
-    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", dist_config.get("cuda_alloc_conf", "expandable_segments:True"))
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", alloc_conf)
+    os.environ.setdefault("PYTORCH_NPU_ALLOC_CONF", alloc_conf)
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     torch.backends.cudnn.benchmark = dist_config.get("cudnn_benchmark", False)
     if dist_config.get("deterministic", False):
         os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+        os.environ["HCCL_DETERMINISTIC"] = "true"
         torch.use_deterministic_algorithms(True)
 
     # Same seed on every rank, before anything constructs a model: replicated
@@ -67,13 +82,14 @@ def configure_distributed(config: Any) -> Any:
         return config
 
     device = None
-    if torch.cuda.is_available():
-        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-        torch.cuda.set_device(local_rank)
-        device = torch.device("cuda", local_rank)
+    device_module = ops.get_device_module()
+    if device_module is not None:
+        local_rank = ops.get_local_rank()
+        device_module.set_device(local_rank)
+        device = torch.device(ops.get_device_type(), local_rank)
 
     timeout_minutes = dist_config.get("timeout_minutes", 30)
-    backend = "cpu:gloo,cuda:nccl" if device is not None else "gloo"
+    backend = ops.get_process_group_backend()
     dist.init_process_group(
         backend=backend,
         timeout=timedelta(minutes=timeout_minutes),

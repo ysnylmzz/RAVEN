@@ -25,6 +25,17 @@ import traceback
 from pathlib import Path
 from typing import Any
 
+# Ascend: registers torch.npu, the "npu" device and the HCCL backend. It must
+# precede configure_distributed(), which resolves the device type and asserts
+# the device is still untouched. Only a missing package means "not an NPU
+# host"; an installed-but-broken torch_npu (e.g. CANN env not sourced) must
+# fail here instead of silently falling back to CUDA/CPU.
+try:
+    import torch_npu  # noqa: F401
+except ModuleNotFoundError as exc:
+    if exc.name != "torch_npu":
+        raise
+
 from .config import CfgNode
 from .distributed.init import configure_distributed, destroy_distributed
 from .logging import configure_logging

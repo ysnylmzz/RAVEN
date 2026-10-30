@@ -645,11 +645,11 @@ class GroupRelativePolicyOptimization(BaseEngine):
 
         RAVEN: grpo.py:440-465 — one random step per group when
         ``random_policy_timestep`` else the full cartesian grid; always shuffled
-        with the phase rng (CPU generator off-device, CUDA generator on-device).
+        with the phase rng (CPU generator off-device, device generator on-device).
         """
         cfg = self.engine_config
         num_policy_steps = len(group_rollouts[0]["rollout_t"]) - int(cfg.skip_timesteps)
-        generator = rng.torch_cuda_generator if advantages.is_cuda else rng.torch_generator
+        generator = rng.torch_device_generator if advantages.device.type != "cpu" else rng.torch_generator
         if getattr(cfg, "random_policy_timestep", False):
             random_step_indices = torch.randint(
                 num_policy_steps,

@@ -251,7 +251,7 @@ class CausalWanT2V:
         assert self.dummy_latents, "only dummy_latents=True is implemented (video_shape_only dataset)"
         latent_shapes = batch["latent_shapes"]
         latents = [
-            torch.empty(*shape, device=device).normal_(generator=rng.torch_cuda_generator)
+            torch.empty(*shape, device=device).normal_(generator=rng.torch_device_generator)
             for shape in latent_shapes
         ]
         batch_size_int = len(latents)
@@ -267,7 +267,7 @@ class CausalWanT2V:
         # equivalence with RAVEN.
         # RAVEN: causal_wan2_1_t2v.py:357-361
         guidance = (
-            torch.rand(batch_size_int, device=device, generator=rng.torch_cuda_generator)
+            torch.rand(batch_size_int, device=device, generator=rng.torch_device_generator)
             * (self.guidance_max - self.guidance_min)
             + self.guidance_min
         )
@@ -508,7 +508,7 @@ class CausalWanT2V:
                         dtype=torch.float32,
                     ).normal_(
                         generator=(
-                            rng.torch_cuda_generator
+                            rng.torch_device_generator
                             if device.type == "cuda"
                             else rng.torch_generator
                         )

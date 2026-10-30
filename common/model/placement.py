@@ -2,13 +2,14 @@
 
 A single default implementation covers both answers to that question: plain
 ``.to(device)`` when no ``fsdp`` node is configured (``device`` defaults to
-``cuda``), ``fully_shard`` across the default device mesh when it is. The EMA
+the current accelerator, CUDA or NPU), ``fully_shard`` across the default
+device mesh when it is. The EMA
 model, when present, is placed identically by the entry (placement classes face
 a single model, like every other stage).
 
 Placement always runs: an omitted ``placement`` node is treated exactly like
 ``placement: {}``, so a built model is never silently left on CPU/meta -- it
-lands on cuda by default. Opt out of the device move only by configuring it
+lands on the accelerator by default. Opt out of the device move only by configuring it
 (``placement.device: cpu``).
 
 Like runtime, placement supports before/after plugins (subclasses of
@@ -24,9 +25,9 @@ natively, then ``to_empty`` materializes each rank's shard).
 
 ::
 
-    # (no placement node)            # same as placement: {} -> .to(cuda)
+    # (no placement node)            # same as placement: {} -> .to(cuda / npu)
 
-    placement: {}                     # .to(cuda)
+    placement: {}                     # .to(cuda / npu)
 
     placement:
       device: cpu                     # .to(cpu)
@@ -96,7 +97,7 @@ _MESHES: dict[tuple[int, int], Any] = {}
 
 
 def _get_hsdp_mesh(shape: tuple[int, int]) -> DeviceMesh:
-    """Create or reuse a 2D CUDA mesh without splitting the composite default PG."""
+    """Create or reuse a 2D device mesh without splitting the composite default PG."""
     if shape in _MESHES:
         return _MESHES[shape]
 
@@ -112,20 +113,21 @@ def _get_hsdp_mesh(shape: tuple[int, int]) -> DeviceMesh:
     # groups carry both backends because DTensor collectives dispatch by tensor
     # device: CPU-offloaded grads make clip_grad_norm_'s partial-norm reduction
     # run on CPU, which needs Gloo on this mesh (same fix as torchtune#2108).
+    backend = ops.get_process_group_backend()
     for row in rank_mesh:
         ranks = row.tolist()
-        group = dist.new_group(ranks=ranks, backend="cpu:gloo,cuda:nccl")
+        group = dist.new_group(ranks=ranks, backend=backend)
         if rank in ranks:
             shard_group = group
     for column in rank_mesh.T:
         ranks = column.tolist()
-        group = dist.new_group(ranks=ranks, backend="cpu:gloo,cuda:nccl")
+        group = dist.new_group(ranks=ranks, backend=backend)
         if rank in ranks:
             replicate_group = group
 
     mesh = DeviceMesh.from_group(
         [replicate_group, shard_group],
-        device_type="cuda",
+        device_type=ops.get_device_type(),
         mesh=rank_mesh,
         mesh_dim_names=("replicate", "shard"),
     )
@@ -222,8 +224,7 @@ class DefaultPlacement:
     """Move to a device, or shard with ``fully_shard`` when ``fsdp`` is set.
 
     Without an ``fsdp`` node the model is moved wholesale to ``device``
-    (default ``cuda``, resolving to the current device set at distributed
-    init). With one, every submodule whose class name is listed in
+    (default: the current CUDA/NPU device set at distributed init). With one, every submodule whose class name is listed in
     ``fsdp.wrap_modules`` (the unit of parameter grouping / communication) is
     sharded, then the root module.
 
@@ -247,7 +248,7 @@ class DefaultPlacement:
     def __call__(self, state: dict[str, Any]) -> dict[str, Any]:
         model = state["model"]
 
-        # Placement speaks Module/CUDA APIs; a non-Module build product has nothing to place.
+        # Placement speaks Module/device APIs; a non-Module build product has nothing to place.
         if not isinstance(model, torch.nn.Module):
             return state
 
@@ -270,7 +271,7 @@ class DefaultPlacement:
         if "fsdp" in self.config:
             state["model"] = self._shard(state["model"], self.config.fsdp, state["name"], trainable, weight_dtype)
         else:
-            device = torch.device(self.config.get("device", "cuda"))
+            device = torch.device(self.config["device"]) if "device" in self.config else ops.get_device()
             model = state["model"].to(device)
             cast_count = 0
             if weight_dtype is not None:
@@ -282,11 +283,13 @@ class DefaultPlacement:
             cast_note = f", cast {cast_count} params to {self.config.weight_dtype}" if weight_dtype is not None else ""
             logger.info("[%s] placed on %s%s", state["name"], device, cast_note)
 
-        # Informational GPU memory report; skipped when CUDA is absent.
-        if torch.cuda.is_available():
+        # Informational device memory report; skipped on CPU-only runs.
+        device_module = ops.get_device_module()
+        if device_module is not None:
             logger.info(
-                "[%s] GPU memory after placement: allocated %.1f GiB, reserved %.1f GiB",
-                state["name"], torch.cuda.memory_allocated() / 2**30, torch.cuda.memory_reserved() / 2**30,
+                "[%s] %s memory after placement: allocated %.1f GiB, reserved %.1f GiB",
+                state["name"], ops.get_device_type().upper(),
+                device_module.memory_allocated() / 2**30, device_module.memory_reserved() / 2**30,
             )
         return state
 

@@ -135,7 +135,7 @@ class CausalWanT2VGRPO(CausalWanT2V):
             # drawn BEFORE infer; SAME noises on neg (RAVEN engine semantics).
             self.sampling_timesteps.set_timesteps(seqlen=rollout_pos_inputs.seqlens, device=device)
             sampling_noises = [
-                torch.empty_like(latent).normal_(generator=rng.torch_cuda_generator)
+                torch.empty_like(latent).normal_(generator=rng.torch_device_generator)
                 for latent in rollout_pos_inputs.latents
             ]
             rollout_pos_inputs.noises = sampling_noises
