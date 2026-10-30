@@ -1,23 +1,54 @@
 #!/bin/bash
 set -exo pipefail
 
+# Ascend hosts ship npu-smi; everything else is treated as CUDA.
+if command -v npu-smi >/dev/null 2>&1; then
+    DEVICE=npu
+else
+    DEVICE=cuda
+fi
+
 eval "$(conda shell.bash hook)"
-export CONDA_ENV="${CONDA_ENV:-raven}"
+if [ "$DEVICE" = npu ]; then
+    export CONDA_ENV="${CONDA_ENV:-raven-npu}"
+else
+    export CONDA_ENV="${CONDA_ENV:-raven}"
+fi
 conda activate "$CONDA_ENV"
 source "venv/bin/activate"
 
-export CUDA_HOME="${CUDA_HOME:-$CONDA_PREFIX}"
-CUDA_TARGET_INCLUDES="$(printf ':%s' "$CUDA_HOME"/targets/*-linux/include)"
-CUDA_TARGET_LIBS="$(printf ':%s' "$CUDA_HOME"/targets/*-linux/lib)"
-export CPATH="${CUDA_TARGET_INCLUDES#:}${CPATH:+:$CPATH}"
-export LIBRARY_PATH="${CUDA_TARGET_LIBS#:}${LIBRARY_PATH:+:$LIBRARY_PATH}"
-export LD_LIBRARY_PATH="${CUDA_TARGET_LIBS#:}:$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+if [ "$DEVICE" = npu ]; then
+    if [ -z "${ASCEND_SET_ENV}" ]; then
+        for candidate in /usr/local/Ascend/ascend-toolkit/set_env.sh /usr/local/Ascend/cann/set_env.sh; do
+            [ -f "$candidate" ] && ASCEND_SET_ENV="$candidate" && break
+        done
+    fi
+    [ -n "${ASCEND_SET_ENV}" ] || { echo "CANN set_env.sh not found; export ASCEND_SET_ENV=/path/to/set_env.sh" >&2; exit 1; }
+    source "$ASCEND_SET_ENV"
 
-N=${N:-${SLURM_GPUS_ON_NODE:-$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)}}  # nproc per node
+    # torch's count, not npu-smi's: it honours ASCEND_RT_VISIBLE_DEVICES and
+    # counts both dies of a dual-die card.
+    N=${N:-$(python -c "import torch, torch_npu; print(torch.npu.device_count())")}  # nproc per node
+    # Ranks reach their first collective on a lazily-created group at different
+    # times while loading 30B+ weights; HCCL's 120 s default link setup is too short.
+    export HCCL_CONNECT_TIMEOUT=${HCCL_CONNECT_TIMEOUT:-1800}
+    export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+    LAUNCH_BLOCKING_VAR=ASCEND_LAUNCH_BLOCKING
+else
+    export CUDA_HOME="${CUDA_HOME:-$CONDA_PREFIX}"
+    CUDA_TARGET_INCLUDES="$(printf ':%s' "$CUDA_HOME"/targets/*-linux/include)"
+    CUDA_TARGET_LIBS="$(printf ':%s' "$CUDA_HOME"/targets/*-linux/lib)"
+    export CPATH="${CUDA_TARGET_INCLUDES#:}${CPATH:+:$CPATH}"
+    export LIBRARY_PATH="${CUDA_TARGET_LIBS#:}${LIBRARY_PATH:+:$LIBRARY_PATH}"
+    export LD_LIBRARY_PATH="${CUDA_TARGET_LIBS#:}:$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+    N=${N:-${SLURM_GPUS_ON_NODE:-$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)}}  # nproc per node
+    export NCCL_DEBUG=INFO
+    export NCCL_IB_TIMEOUT=31
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    LAUNCH_BLOCKING_VAR=CUDA_LAUNCH_BLOCKING
+fi
 D=${D:-0}  # debug mode
-export NCCL_DEBUG=INFO
-export NCCL_IB_TIMEOUT=31
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export TOKENIZERS_PARALLELISM=false
 
 NNODES=${NNODES:-${SLURM_NNODES:-1}}
@@ -56,7 +87,7 @@ if [ $D -eq 0 ]; then
 else
     DEBUGPY_PORT=${DEBUGPY_PORT:-5678}
     export PYDEVD_WARN_SLOW_RESOLVE_TIMEOUT=30
-    export CUDA_LAUNCH_BLOCKING=1
+    export "$LAUNCH_BLOCKING_VAR"=1
     python -m debugpy --listen 0.0.0.0:$DEBUGPY_PORT --wait-for-client $(which torchrun) \
         --nnodes 1 \
         --nproc_per_node $D \

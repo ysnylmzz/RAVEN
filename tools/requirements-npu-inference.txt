@@ -1,0 +1,32 @@
+# Ascend NPU inference for projects/minimax_h3. Shared pins match requirements.lock.
+# Install with tools/prepare_venv_npu.sh (needs the PyTorch CPU index for the +cpu wheels).
+pip
+python-hostlist
+packaging>=24.2
+setuptools>=78.1.1
+wheel
+debugpy
+numpy==2.1.0
+einops==0.8.1
+peft==0.17.1
+transformers==4.57.1
+diffusers==0.37.0
+accelerate==1.13.0
+safetensors==0.7.0
+av==15.1.0
+pillow==11.3.0
+pyyaml==6.0.3
+tabulate==0.10.0
+wandb==0.22.3
+torch==2.11.0+cpu
+torchvision==0.26.0+cpu
+torch_npu==2.11.0.post3
+# Imported by CANN's operator compiler, which runs inside the torch_npu process.
+absl-py==2.4.0
+attrs==26.1.0
+cloudpickle
+decorator==5.2.1
+ml-dtypes==0.5.4
+psutil==7.2.2
+scipy==1.15.3
+tornado

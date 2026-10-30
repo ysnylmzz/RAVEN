@@ -1,0 +1,22 @@
+name: raven-npu
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - uv
+  - huggingface_hub
+  - libgl
+  - libglib
+  - xorg-libx11
+  - xorg-libxext
+  - xorg-libsm
+  - xorg-libice
+  - git
+  - curl
+  - wget
+  - unzip
+  - ffmpeg
+  - ncurses
+  - zsh
+  - numpy
