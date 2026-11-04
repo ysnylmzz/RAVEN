@@ -46,6 +46,45 @@ def _npu_chunked_conv1d(x, weight, *, stride: int, groups: int):
     return torch.cat(pieces, dim=-1)
 
 
+def _npu_chunked_conv_transpose1d(x, weight, *, stride: int, groups: int):
+    """Transposed 1D convolution in chunks, summed over the overlaps.
+
+    Each input sample feeds ``kernel_size`` consecutive outputs, so chunks
+    taken from neighbouring input ranges overlap by ``kernel_size - stride``
+    and their contributions add. Equivalent to
+    ``F.conv_transpose1d(x, weight, stride=stride, groups=groups)`` apart
+    from potential backend floating-point rounding differences.
+    """
+    kernel_size = weight.shape[-1]
+    if stride <= 0:
+        raise ValueError("stride must be positive")
+    if kernel_size > _NPU_CONV1D_CHUNK_SIZE:
+        raise ValueError("kernel is larger than the NPU convolution chunk size")
+
+    input_length = x.shape[-1]
+    output_length = (input_length - 1) * stride + kernel_size
+
+    # Sized so that a chunk's output stays within the chunk size as well, not
+    # just its input: the transposed convolution widens by roughly ``stride``.
+    inputs_per_chunk = (_NPU_CONV1D_CHUNK_SIZE - kernel_size) // stride + 1
+
+    out = None
+    for input_start in range(0, input_length, inputs_per_chunk):
+        input_end = min(input_start + inputs_per_chunk, input_length)
+        piece = F.conv_transpose1d(
+            x[..., input_start:input_end].contiguous(),
+            weight,
+            stride=stride,
+            groups=groups,
+        )
+        if out is None:
+            out = piece.new_zeros(*piece.shape[:-1], output_length)
+        output_start = input_start * stride
+        out[..., output_start : output_start + piece.shape[-1]] += piece
+
+    return out
+
+
 if "sinc" in dir(torch):
     sinc = torch.sinc
 else:
@@ -165,9 +204,18 @@ class UpSample1d(nn.Module):
         _, C, _ = x.shape
 
         x = F.pad(x, (self.pad, self.pad), mode="replicate")
-        x = F.conv_transpose1d(
-            x, self.filter.expand(C, -1, -1), stride=self.stride, groups=C
-        )
+
+        # The limit applies to the convolution's input, not its output: this
+        # layer already emits more than _NPU_CONV1D_WIDTH_LIMIT samples one
+        # upsample ratio before its own input reaches it.
+        weight = self.filter.expand(C, -1, -1)
+        if x.device.type == "npu" and x.shape[-1] > _NPU_CONV1D_WIDTH_LIMIT:
+            x = _npu_chunked_conv_transpose1d(
+                x, weight, stride=self.stride, groups=C
+            )
+        else:
+            x = F.conv_transpose1d(x, weight, stride=self.stride, groups=C)
+
         x.mul_(self.ratio)
         x = x[..., self.pad_left : -self.pad_right]
 
