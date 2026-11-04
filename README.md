@@ -52,6 +52,8 @@ Nothing in `common/` imports from `projects/`. Projects are reached only through
 
 The current build targets Linux, NVIDIA Hopper GPUs (SM90), Python 3.10, and CUDA 12.8.
 
+For streaming inference on Huawei Ascend NPUs, see [README-NPU.md](README-NPU.md) instead.
+
 Run these commands from the repository root.
 
 ```sh
