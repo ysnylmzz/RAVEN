@@ -7,6 +7,45 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
+# Maximum padded input width per convolution call on the NPU.
+# CANN Conv2DV2 rejects widths above 1,000,000 in the tested environment.
+_NPU_CONV1D_CHUNK_SIZE = 500_000
+_NPU_CONV1D_WIDTH_LIMIT = 1_000_000
+
+
+def _npu_chunked_conv1d(x, weight, *, stride: int, groups: int):
+    """Valid 1D convolution in overlapping chunks aligned to output indices.
+
+    ``x`` has already been padded, if requested by the caller. This is
+    equivalent to ``F.conv1d(x, weight, stride=stride, groups=groups)``
+    apart from potential backend floating-point rounding differences.
+    """
+    kernel_size = weight.shape[-1]
+    if stride <= 0:
+        raise ValueError("stride must be positive")
+    if kernel_size > _NPU_CONV1D_CHUNK_SIZE:
+        raise ValueError("kernel is larger than the NPU convolution chunk size")
+
+    output_length = (x.shape[-1] - kernel_size) // stride + 1
+    if output_length <= 0:
+        # Match the usual PyTorch error for an input shorter than the kernel.
+        return F.conv1d(x, weight, stride=stride, groups=groups)
+
+    outputs_per_chunk = (_NPU_CONV1D_CHUNK_SIZE - kernel_size) // stride + 1
+    pieces = []
+    for output_start in range(0, output_length, outputs_per_chunk):
+        output_end = min(output_start + outputs_per_chunk, output_length)
+        input_start = output_start * stride
+        input_end = (output_end - 1) * stride + kernel_size
+        input_chunk = x[..., input_start:input_end].contiguous()
+        pieces.append(
+            F.conv1d(input_chunk, weight, stride=stride, groups=groups)
+        )
+
+    return torch.cat(pieces, dim=-1)
+
+
 if "sinc" in dir(torch):
     sinc = torch.sinc
 else:
@@ -31,7 +70,6 @@ def kaiser_sinc_filter1d(
 ):  # return filter [1,1,kernel_size]
     even = kernel_size % 2 == 0
     half_size = kernel_size // 2
-
     # For kaiser window
     delta_f = 4 * half_width
     A = 2.285 * (half_size - 1) * math.pi * delta_f + 7.95
@@ -42,7 +80,6 @@ def kaiser_sinc_filter1d(
     else:
         beta = 0.0
     window = torch.kaiser_window(kernel_size, beta=beta, periodic=False)
-
     # ratio = 0.5/cutoff -> 2 * cutoff = 1 / ratio
     if even:
         time = torch.arange(-half_size, half_size) + 0.5
@@ -57,7 +94,6 @@ def kaiser_sinc_filter1d(
         """
         filter_ /= filter_.sum()
         filter = filter_.view(1, 1, kernel_size)
-
     return filter
 
 
@@ -95,7 +131,12 @@ class LowPassFilter1d(nn.Module):
 
         if self.padding:
             x = F.pad(x, (self.pad_left, self.pad_right), mode=self.padding_mode)
-        out = F.conv1d(x, self.filter.expand(C, -1, -1), stride=self.stride, groups=C)
+
+        weight = self.filter.expand(C, -1, -1)
+        if x.device.type == "npu" and x.shape[-1] > _NPU_CONV1D_WIDTH_LIMIT:
+            out = _npu_chunked_conv1d(x, weight, stride=self.stride, groups=C)
+        else:
+            out = F.conv1d(x, weight, stride=self.stride, groups=C)
 
         return out
 
@@ -149,7 +190,6 @@ class DownSample1d(nn.Module):
 
     def forward(self, x):
         xx = self.lowpass(x)
-
         return xx
 
 
