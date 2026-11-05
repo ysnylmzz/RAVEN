@@ -22,10 +22,13 @@ Ascend 910B (64 GiB per card) is also supported, but the 33.1B DiT no longer
 fits a single card without FSDP CPU offload. See
 [Choosing a trial](#choosing-a-trial).
 
-FlashAttention is not available on NPU. `utils/flash_attn.py` falls back to a
-varlen `scaled_dot_product_attention` path, which materializes the score
-matrix. This works, but it is the dominant cost in both time and transient
-memory. See [Performance](#performance).
+FlashAttention is not available on NPU. For the cached streaming rollout
+(non-causal varlen attention), `utils/flash_attn.py` routes to
+`torch_npu.npu_fusion_attention` in TND layout. Everything else falls back to
+a per-document `scaled_dot_product_attention` path that materializes the score
+matrix. `RAVEN_NPU_FUSED_ATTN=0` forces that fallback for the rollout too.
+The figures under [Performance](#performance) were measured on the fallback,
+before the fused path existed.
 
 ## Container
 
@@ -255,6 +258,22 @@ Real-time factor is about 35×. The SDPA fallback is the bottleneck; replacing
 it with `npu_fusion_attention` is the main remaining optimization and would
 cut both the transient memory and the time.
 
+### Finding where the time goes
+
+All three of these tools run on the real model build or at its real shapes:
+
+- **Attention microbenchmark.** `python -m projects.minimax_h3.tools.bench_npu_attention`
+  checks the fused kernel against SDPA on a ragged packing, then times both
+  at the production per-rank shapes as the KV cache fills.
+- **Phase and chunk breakdown.**
+  `trials/npu/npu_bench_rtf_8card_950.yaml` is the production 8-card build
+  with the RTF engine. It splits encode / rollout / decode, discards a warmup
+  pass, and logs the backbone's parameter dtypes, LoRA adapter separately.
+  Its header lists the one-variable A/B runs.
+- **Op-level trace.** Add `benchmark.profile true` to wrap one steady-state
+  chunk in the `torch_npu` profiler. The trace is written under
+  `benchmark/profile/rank0/` and opens in MindStudio Insight.
+
 ## What the port changes
 
 | File | Change |
@@ -325,8 +344,9 @@ Use the production trial rather than raising the resolution on
 
 ## Known gaps
 
-- `npu_fusion_attention` is not wired in yet; the SDPA fallback is the main
-  cost in both time and transient memory.
+- `npu_fusion_attention` covers only the non-causal cached rollout. Causal
+  varlen attention still uses the SDPA fallback. The fused path has not yet
+  been timed end to end against the figures in [Performance](#performance).
 - FSDP `CPUOffloadPolicy` across multiple ranks is unverified — it needs
   `--ulimit memlock=-1` and has not been run to completion.
 - Training on NPU is untested.

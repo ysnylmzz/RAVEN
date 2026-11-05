@@ -69,6 +69,95 @@ def _sdpa_varlen(q, k, v, *, q_bounds, k_bounds, dropout_p, softmax_scale, causa
 # ===== PACKED SDPA FALLBACK END =====
 
 
+# ===== NPU FUSED ATTENTION BEGIN =====
+# On Ascend, ``torch_npu.npu_fusion_attention`` is a FlashAttention-style kernel:
+# it tiles the softmax instead of materializing the [N, Lq, Lk] score matrix the
+# SDPA fallback above builds per document. The TND layout takes the packed
+# [T, N, D] rows directly, with cumulative per-document lengths, so no
+# per-document loop is needed either.
+#
+# Only the non-causal, dropout-free case is routed here -- that is the cached
+# streaming rollout. Causal varlen would need sparse_mode 3 plus a 2048x2048
+# mask to get FlashAttention's bottom-right alignment; it stays on SDPA, which
+# refuses the mismatched-length case explicitly.
+#
+# RAVEN_NPU_FUSED_ATTN=0 forces the SDPA fallback, for A/B timing and for
+# checking the fused kernel's numerics against it.
+try:
+    import torch_npu
+    _NPU_FUSION_ATTN = getattr(torch_npu, "npu_fusion_attention", None)
+except ImportError:
+    _NPU_FUSION_ATTN = None
+NPU_FUSED_ATTN_AVAILABLE = (
+    _NPU_FUSION_ATTN is not None
+    and bool(int(os.environ.get("RAVEN_NPU_FUSED_ATTN", "1")))
+)
+
+
+def _npu_fused_varlen(q, k, v, *, q_bounds, k_bounds, softmax_scale):
+    """Non-causal packed attention through ``npu_fusion_attention`` (TND).
+
+    ``q_bounds`` / ``k_bounds`` are the host-side prefix sums with a leading 0;
+    the kernel wants them without it.
+    """
+    scale = softmax_scale if softmax_scale is not None else q.shape[-1] ** -0.5
+    return _NPU_FUSION_ATTN(
+        q.contiguous(),
+        k.contiguous(),
+        v.contiguous(),
+        q.shape[1],
+        "TND",
+        scale=scale,
+        keep_prob=1.0,
+        actual_seq_qlen=q_bounds[1:],
+        actual_seq_kvlen=k_bounds[1:],
+    )[0]
+
+
+def _npu_fused_supported(q, *, q_bounds, k_bounds, dropout_p, causal):
+    return (
+        NPU_FUSED_ATTN_AVAILABLE
+        and q.device.type == "npu"
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and not causal
+        and dropout_p == 0.0
+        # The kernel rejects zero-length documents; SDPA just skips them.
+        and all(b > a for a, b in zip(q_bounds[:-1], q_bounds[1:]))
+        and all(b > a for a, b in zip(k_bounds[:-1], k_bounds[1:]))
+    )
+
+
+# The lengths live on the device, so turning them into host bounds is a
+# device->host sync that drains the launch queue. Every layer of one forward
+# receives the very same q_lens / k_lens tensor objects, so keep the last
+# conversion and reuse it while the objects (and their in-place version
+# counters) are unchanged: one sync per forward instead of one per layer.
+# Holding the references keeps the ids from being recycled under us.
+_HOST_BOUNDS_CACHE = None
+
+
+def _host_bounds(q_lens, k_lens):
+    global _HOST_BOUNDS_CACHE
+    try:
+        versions = (q_lens._version, k_lens._version)
+    except RuntimeError:  # inference-mode tensors carry no version counter
+        versions = None
+    cached = _HOST_BOUNDS_CACHE
+    if (
+        versions is not None
+        and cached is not None
+        and cached[0] is q_lens
+        and cached[1] is k_lens
+        and cached[2] == versions
+    ):
+        return cached[3], cached[4]
+    q_bounds = torch.cat([q_lens.new_zeros([1]), q_lens]).cumsum(0).tolist()
+    k_bounds = torch.cat([k_lens.new_zeros([1]), k_lens]).cumsum(0).tolist()
+    _HOST_BOUNDS_CACHE = (q_lens, k_lens, versions, q_bounds, k_bounds) if versions else None
+    return q_bounds, k_bounds
+# ===== NPU FUSED ATTENTION END =====
+
+
 class _FlashAttentionVarlen(nn.Module):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -147,12 +236,16 @@ class FlashAttention(nn.Module):
                     f"q_lens has {len(q_lens)} documents but k_lens has "
                     f"{len(k_lens_effective)}; they describe the same packing"
                 )
-            q_bounds = torch.cat([q_lens.new_zeros([1]), q_lens]).cumsum(0).tolist()
-            k_bounds = (
-                torch.cat([k_lens_effective.new_zeros([1]), k_lens_effective])
-                .cumsum(0)
-                .tolist()
-            )
+            q_bounds, k_bounds = _host_bounds(q_lens, k_lens_effective)
+            if _npu_fused_supported(
+                q, q_bounds=q_bounds, k_bounds=k_bounds, dropout_p=dropout_p, causal=causal
+            ):
+                return _npu_fused_varlen(
+                    q, k, v,
+                    q_bounds=q_bounds,
+                    k_bounds=k_bounds,
+                    softmax_scale=softmax_scale,
+                )
             return _sdpa_varlen(
                 q, k, v,
                 q_bounds=q_bounds,
