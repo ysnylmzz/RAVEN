@@ -1,0 +1,19 @@
+# RTF benchmark on a 64 GiB Ascend card (910B), single rank.
+#
+# Step 4a's build: both the DiT and the text encoder on a 1-rank FSDP mesh for
+# CPU offload, so the weight streaming sits on the measured critical path --
+# expect a markedly worse RTF than the 950 variant, which is the point of
+# having both.
+#
+#   ASCEND_RT_VISIBLE_DEVICES=0 N=1 bash tools/multi_run.sh projects/minimax_h3/trials/npu/npu_bench_rtf.yaml
+__inherit__: npu_4a_single_card.yaml
+
+entry:
+  module: projects.minimax_h3.tools.benchmark_rtf
+  class_name: RTFBenchmarkEngine
+
+benchmark:
+  warmup: 1
+  iters: 3
+  decode: true
+  per_chunk: true

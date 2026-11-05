@@ -1,0 +1,20 @@
+# A/B against npu_bench_rtf_8card_950: the DiT placed whole on every card.
+#
+# Under FSDP2 shard_size 8 with reshard_after_forward, every chunk forward
+# all-gathers the full ~66 GB bf16 trunk again -- 44+ forwards per clip. A
+# 128 GiB card holds the trunk outright, so this variant drops the sharding
+# and keeps only Ulysses SP; the difference in rollout time is what the
+# all-gathers cost.
+#
+# Run it with the fused attention on (the default): with the SDPA fallback's
+# ~55 GiB of transient score matrices on top of a 66 GB trunk the card is at
+# its limit. Not yet run to completion -- unverified.
+#
+#   ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 HCCL_NPU_SOCKET_PORT_RANGE=auto \
+#   N=8 bash tools/multi_run.sh projects/minimax_h3/trials/npu/npu_bench_rtf_8card_950_replicated.yaml
+__inherit__: npu_bench_rtf_8card_950.yaml
+
+models:
+  backbone:
+    placement:
+      fsdp: null
