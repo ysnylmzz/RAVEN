@@ -4,7 +4,9 @@
 #
 # Deviations from the released component config, both deliberate:
 #   parallel_tiling: released 1 -> false. That path needs sglang's
-#     decode-parallel state, which is not vendored (see the fence in klvae.py).
+#     decode-parallel state, which is not vendored, and setup_forward would
+#     keep the constructor's default anyway. The decode tiles are split by
+#     klvae.tile_parallel_group instead (validation.decode_parallel).
 #   chunk_dim: dropped. setup_forward() does not read it.
 # vae_ratio (16) and vae_ratio_t (4) are derived from space_down/time_down
 # in the constructor and must not be passed.

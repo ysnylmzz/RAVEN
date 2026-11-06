@@ -28,7 +28,9 @@ The phase split mirrors the production path:
 
     encode   ``_validation_inputs``  (Qwen3-VL text encoder, once per prompt)
     rollout  ``_rollout_latents``    (the 4-NFE causal chunk loop -- the DiT)
-    decode   ``_decode_latents``     (video VAE + audio VAE)
+    decode   ``_decode_latents``     (video VAE + audio VAE; the video tiles are
+                                      split across the SP group unless
+                                      validation.decode_parallel is false)
 
 ``_chunk_forward`` is additionally wrapped so the rollout's internal structure
 falls out: per-chunk latency and, for streaming, time-to-first-chunk -- when
@@ -282,11 +284,18 @@ class RTFBenchmarkEngine(BaseEngine):
         # the same work, not prompt-to-prompt variance of different work.
         prompt = prompts[0]
 
-        # Decode runs on the SP group's main rank only, exactly as validate
-        # does -- the VAEs are unsharded, so a non-main rank decoding would be
-        # duplicated work that distorts the slowest-rank reduction.
+        # Decode exactly as validate does: with validation.decode_parallel the
+        # whole SP group shares the video decode tiles; without it only the
+        # group's main rank decodes, since a full decode on every rank would
+        # be duplicated work that distorts the slowest-rank reduction.
         sp_size = meta._sp_size()
         is_group_main = ops.get_rank() % sp_size == 0
+        decode_group = meta._decode_group(validation)
+        logger.info(
+            "[benchmark] video decode: %s",
+            f"tiles split across the SP group ({sp_size} ranks)"
+            if decode_group is not None else "main rank of each SP group only",
+        )
 
         fps = int(validation.get("fps", MINIMAX_H3_SUPPORTED_FPS))
         num_frames = int(validation.num_frames)
@@ -319,9 +328,9 @@ class RTFBenchmarkEngine(BaseEngine):
                     if measured and index == warmup and device_module is not None:
                         device_module.reset_peak_memory_stats()
 
-                    # Decode runs on the SP main ranks only, so without this
-                    # the other ranks enter the next encode early and its
-                    # timer absorbs the wait for that decode: encode, and the
+                    # When decode runs on the SP main ranks only, the other
+                    # ranks would enter the next encode early and its timer
+                    # would absorb the wait for that decode: encode, and the
                     # max-reduced total, came out ~one decode too long.
                     timer.sync()
                     ops.barrier()
@@ -347,9 +356,11 @@ class RTFBenchmarkEngine(BaseEngine):
                                 backbone, inputs, rng, keep_trajectory=False, rngs=[rng]
                             )
 
-                    if want_decode and is_group_main:
+                    if want_decode and (is_group_main or decode_group is not None):
                         with timer.measure(phases, "decode"):
-                            frames, waveform = meta._decode_latents(models, latents, index=0)
+                            frames, waveform = meta._decode_latents(
+                                models, latents, index=0, decode_group=decode_group
+                            )
                         # Trust the decoder over the config for the clip length
                         # the RTF divides by.
                         decoded_frames = int(frames.shape[2])
@@ -430,8 +441,9 @@ class RTFBenchmarkEngine(BaseEngine):
         dtype_report: dict[str, dict[str, int]],
     ) -> None:
         """Reduce across ranks, then log and persist the result from rank 0."""
-        # Slowest rank sets the wall clock. decode is absent on non-main ranks,
-        # so the default keeps max() from inventing a faster run.
+        # Slowest rank sets the wall clock. Without a shared decode, decode is
+        # absent on non-main ranks, so the default keeps max() from inventing
+        # a faster run.
         gathered = ops.all_gather_object(iterations)
         merged: list[dict[str, float]] = []
         for index in range(len(iterations)):

@@ -69,6 +69,7 @@ from common.diffusion.schedule import PredictionType
 from common.distributed import ops
 from common.distributed.ops import all_reduce_sum, get_device, get_world_size
 from common.distributed.unified_parallel import (
+    get_unified_parallel_group,
     get_unified_parallel_world_size,
     is_unified_parallel_initialized,
 )
@@ -83,6 +84,7 @@ from projects.minimax_h3.modeling.packed_tokens import (
     minimax_h3_unpatchify_video_tokens,
 )
 from projects.minimax_h3.modeling.packing import minimax_h3_packed_sequence
+from projects.minimax_h3.modeling.video_vae.klvae import tile_parallel_group
 from utils.flex_attn import _prepare_flex_attention_mask, create_sparse_mask
 from utils.naive_cache import NaiveCache
 
@@ -617,6 +619,7 @@ class CausalMiniMaxH3Base:
         original_training = [(model, model.training) for _, model in variants]
         saved_items: list[tuple[str, str, str, str]] = []
         fps = int(validation.get("fps", MINIMAX_H3_SUPPORTED_FPS))
+        decode_group = self._decode_group(validation)
         try:
             for _, model in variants:
                 model.eval()
@@ -655,9 +658,19 @@ class CausalMiniMaxH3Base:
                         backbone, inputs, sample_rngs[0], keep_trajectory=False, rngs=sample_rngs
                     )
                     for index, entry in enumerate(batch_entries):
-                        if not (is_group_main and entry["should_save"]):
+                        # should_save is the same on every rank of a group (it
+                        # depends on the group's slice only), so with a shared
+                        # decode the whole group decodes and the main rank saves.
+                        if not entry["should_save"]:
                             continue
-                        frames, waveform = self._decode_latents(models, latents, index=index)
+                        if decode_group is None and not is_group_main:
+                            continue
+                        frames, waveform = self._decode_latents(
+                            models, latents, index=index, decode_group=decode_group
+                        )
+                        if not is_group_main:
+                            del frames, waveform
+                            continue
                         name = f"validation/{variant_name}/prompt{entry['prompt_idx']:04d}.mp4"
                         path = media_dir / name
                         path.parent.mkdir(parents=True, exist_ok=True)
@@ -881,9 +894,24 @@ class CausalMiniMaxH3Base:
         )
         return self._build_inputs(batch, prompt_embeds)
 
+    def _decode_group(self, validation: Any) -> Any:
+        """The process group that shares the video decode, or None for local.
+
+        ``validation.decode_parallel`` (default on) splits each temporal clip's
+        decoder tiles across the SP group: its ranks already hold identical
+        latents (the SP forward gathers its output on every rank) and would
+        otherwise sit idle while the main rank decodes alone.
+        """
+        if not bool(validation.get("decode_parallel", True)) or self._sp_size() <= 1:
+            return None
+        return get_unified_parallel_group()
+
     @staticmethod
     def _decode_latents(
-        models: dict[str, Any], latents: _RolloutX0s, index: int = 0
+        models: dict[str, Any],
+        latents: _RolloutX0s,
+        index: int = 0,
+        decode_group: Any = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Normalized latents -> ``([1,3,F,H,W]`` in [0,1], ``[2, samples]``).
 
@@ -893,6 +921,11 @@ class CausalMiniMaxH3Base:
         ``decode``) so the released clip_length/token_drop/tiling knobs are
         honoured, and ``revert_tensor`` to leave ImageNet-normalized space.
         Audio needs no vocoder node: ``DacAudioVAE.decode`` runs BigVGAN itself.
+
+        With ``decode_group`` (see ``_decode_group``) every rank of that group
+        must call this with the same latents. The video decoder tiles are split
+        across the group and gathered, so every rank returns the full result;
+        the audio decode is small and simply runs on each of them.
         """
         video_vae = models["video_vae"]
         audio_vae = models["audio_vae"]
@@ -907,7 +940,9 @@ class CausalMiniMaxH3Base:
         video = video * video_vae.latents_std.to(video).view(
             1, -1, 1, 1, 1
         ) + video_vae.latents_mean.to(video).view(1, -1, 1, 1, 1)
-        frames = video_vae.processor.revert_tensor(video_vae.decode_base(video))
+        with tile_parallel_group(decode_group):
+            decoded = video_vae.decode_base(video)
+        frames = video_vae.processor.revert_tensor(decoded)
 
         # Stereo is two mono batch items, so the statistics broadcast over dim 1.
         audio = latents.audio[index]

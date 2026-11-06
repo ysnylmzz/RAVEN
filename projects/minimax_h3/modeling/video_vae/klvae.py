@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # MiniMax H3 visual VAE: 3D causal CNN encoder + ViT3D decoder (inference-only bundle).
+import contextlib
 import math
 import os
 from typing import List, Union
@@ -14,7 +15,7 @@ from diffusers.models import ModelMixin
 from diffusers.utils import logging
 from PIL import Image
 
-# ===== JARVIS PATCH BEGIN(sglang decode-parallel state unavailable; only reachable via parallel_tiling=True, which we do not use) =====
+# ===== JARVIS PATCH BEGIN(sglang decode-parallel state is not vendored; tile_parallel_group below stands in for it with a plain torch process group) =====
 # from sglang.multimodal_gen.runtime.distributed import (
 #     get_decode_parallel_group_coordinator,
 #     get_decode_parallel_rank,
@@ -66,10 +67,40 @@ def _resolve_temporal_stream_cat():
     return raw not in ("0", "false", "no", "off", "disable", "disabled")
 
 
+# ===== JARVIS PATCH BEGIN(sglang decode-parallel state is not vendored: the caller names the group for the extent of one decode instead of a global sglang coordinator) =====
+# def get_tile_parallel_state():
+#     if not dist.is_initialized() or not model_parallel_is_initialized():
+#         return 0, 1
+#     return get_decode_parallel_rank(), get_decode_parallel_world_size()
+_TILE_PARALLEL_GROUP = None
+
+
+@contextlib.contextmanager
+def tile_parallel_group(group):
+    """Split tiled encode/decode tiles across ``group`` inside this block.
+
+    Every rank of ``group`` must make the same encode/decode calls on the same
+    input: each decodes its round-robin share of the tiles and one all-gather
+    per call hands every rank all of them. ``None`` (or a one-rank group)
+    leaves tiling local, which is also what happens outside any block.
+    """
+    global _TILE_PARALLEL_GROUP
+    previous = _TILE_PARALLEL_GROUP
+    _TILE_PARALLEL_GROUP = group
+    try:
+        yield
+    finally:
+        _TILE_PARALLEL_GROUP = previous
+
+
 def get_tile_parallel_state():
-    if not dist.is_initialized() or not model_parallel_is_initialized():
+    group = _TILE_PARALLEL_GROUP
+    if group is None or not dist.is_initialized():
         return 0, 1
-    return get_decode_parallel_rank(), get_decode_parallel_world_size()
+    return dist.get_rank(group), dist.get_world_size(group)
+
+
+# ===== JARVIS PATCH END =====
 
 
 class DiagonalGaussianDistribution(object):
@@ -352,9 +383,13 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         # single equal-shape all-gather; the previous path paid for a barrier,
         # a shape all-gather, and then a padded data all-gather per temporal
         # clip.
-        gathered = get_decode_parallel_group_coordinator().all_gather(
-            stacked, separate_tensors=True
-        )
+        # ===== JARVIS PATCH BEGIN(sglang decode-parallel state is not vendored: gather over the tile_parallel_group process group; the list comes back in group-rank order, as the coordinator's did) =====
+        # gathered = get_decode_parallel_group_coordinator().all_gather(
+        #     stacked, separate_tensors=True
+        # )
+        gathered = [torch.empty_like(stacked) for _ in range(tile_world_size)]
+        dist.all_gather(gathered, stacked, group=_TILE_PARALLEL_GROUP)
+        # ===== JARVIS PATCH END =====
 
         results = [None] * num_tiles
         for rank, rank_tensors in enumerate(gathered):
@@ -390,7 +425,10 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         return tasks
 
     def tiled_encode(self, x):
-        if self.parallel_tiling:  # Fast online encoding for large videos
+        # ===== JARVIS PATCH BEGIN(an open tile_parallel_group also splits the tiles: parallel_tiling is frozen at its constructor default, since AutoencoderKLLegacy.__init__ runs setup_forward before the forward kwargs arrive) =====
+        # if self.parallel_tiling:  # Fast online encoding for large videos
+        if self.parallel_tiling or _TILE_PARALLEL_GROUP is not None:
+        # ===== JARVIS PATCH END =====
             tile_rank, tile_world_size = get_tile_parallel_state()
         else:
             tile_rank, tile_world_size = 0, 1
@@ -450,7 +488,10 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         return z
 
     def tiled_decode(self, z):
-        if self.parallel_tiling:  # Fast online decoding for large videos
+        # ===== JARVIS PATCH BEGIN(an open tile_parallel_group also splits the tiles: parallel_tiling is frozen at its constructor default, since AutoencoderKLLegacy.__init__ runs setup_forward before the forward kwargs arrive) =====
+        # if self.parallel_tiling:  # Fast online decoding for large videos
+        if self.parallel_tiling or _TILE_PARALLEL_GROUP is not None:
+        # ===== JARVIS PATCH END =====
             tile_rank, tile_world_size = get_tile_parallel_state()
         else:
             tile_rank, tile_world_size = 0, 1
