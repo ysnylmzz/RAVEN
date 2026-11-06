@@ -288,20 +288,34 @@ Peak memory is the allocator's `max_memory_allocated`, not `npu-smi`.
 | FSDP, SDPA attention | 32.6 | 232.4 s | 27.9 s | 8.98 s | 48.0 GiB |
 | FSDP, fused attention | 11.6 | 63.8 s | 28.5 s | 5.63 s | 36.2 GiB |
 | Replicated DiT, fused attention | 9.0 | 42.8 s | 28.1 s | 2.66 s | 92.0 GiB |
-| + LoRA merged, contiguous KV merge (`npu_8card_950.yaml`) | not yet measured | | | | |
+| + LoRA merged, contiguous KV merge | 7.8 | 32.4 s | 29.1 s | 1.74 s | 87.3 GiB |
+| + decode split across the SP group (`npu_8card_950.yaml`) | not yet measured | | | | |
 
 The figures drift with card temperature. Under sustained load the cards in the
 validated machine reached 98 °C and every iteration after the first ran
 slower. The replicated build's first measured iteration took 35.0 s of
-rollout (RTF 7.2), and the later ones 43–47 s. Compare runs on the same
-iteration index, and watch `npu-smi info` while measuring.
+rollout (RTF 7.2), and the later ones 43–47 s. With the LoRA merged, rollout
+went from 25.3 s on the first iteration to 37.6 s on the fourth, and decode
+from 22.5 s to 31.7 s. Compare runs on the same iteration index, and watch
+`npu-smi info` while measuring.
+
+The same build with the merge turned off
+(`models.backbone.placement.plugins.0.enabled false`) measured RTF 8.6,
+rollout 39.8 s and peak memory 92.0 GiB. Its total was about 7 s higher on
+every iteration, so the merge alone saves about 18% of rollout and the
+4.7 GiB of the fp32 adapter.
 
 An op-level profile of one steady-state forward on the replicated build,
 before the last row's changes, split roughly as follows. Base matmuls took 29%
 and the fp32 LoRA path (matmuls, casts and adds) 26%. FlashAttention took 17%,
-the KV cache merge 11%, and the Ulysses all-to-all 6%. Decode runs the
-unsharded VAE on one card per SP group and is now about a third of the
-wall clock.
+the KV cache merge 11%, and the Ulysses all-to-all 6%.
+
+After the merge, decode was 47% of the wall clock: it ran the unsharded VAE on
+one card per SP group while the other three waited. The last row decodes on
+all four. At 768x1376 each temporal clip is 4 x 7 = 28 decoder tiles, so each
+card decodes 7 and one all-gather per clip hands every card all 28. The
+output is the same as decoding on one card. `validation.decode_parallel false`
+restores the one-card decode.
 
 ### Finding where the time goes
 
@@ -334,6 +348,8 @@ All three of these tools run on the real model build or at its real shapes:
 | `utils/flash_attn.py` | Non-causal varlen attention routed to `torch_npu.npu_fusion_attention` (TND layout) on NPU. |
 | `projects/minimax_h3/modeling/transformer/causal_model*.py` | The cached rollout makes the new K/V contiguous before merging them with the cache; strided sources sent `index_put` down a slow path. |
 | `common/plugin/lora_merge.py` | Placement plugin that merges a LoRA adapter into the base weights for inference and unloads it. |
+| `projects/minimax_h3/modeling/video_vae/klvae.py` | `tile_parallel_group(group)` replaces the unvendored sglang decode-parallel state, so the released tile-parallel decode runs over a torch process group. |
+| `projects/minimax_h3/meta_models/causal_minimax_h3_base.py` | Validation decodes on every rank of the SP group with the tiles split between them (`validation.decode_parallel`, on by default); the group's main rank still writes the video. |
 | `projects/minimax_h3/tools/` | `bench_npu_attention` (attention microbenchmark) and `benchmark_rtf` (RTF engine). |
 | `projects/minimax_h3/trials/npu/` | Bring-up trials, the 950 production trial and the RTF benchmark trials. |
 
@@ -396,11 +412,12 @@ Use the production trial rather than raising the resolution on
 
 - `npu_fusion_attention` covers only the non-causal cached rollout. Causal
   varlen attention still uses the SDPA fallback.
-- The LoRA merge and the contiguous KV merge in `npu_8card_950.yaml` have not
-  yet been measured on hardware, nor has its video been compared with the
-  unmerged build.
-- Decode runs on one card per SP group while the others idle; it is about a
-  third of the wall clock on the 950 build.
+- The SP-group decode has been checked for identical output on CPU only. It
+  has not yet been timed on hardware.
+- The audio VAE decode is not split: every rank of the SP group runs the same
+  one.
+- The contiguous KV merge has not been measured on its own. Comparing
+  sessions puts it at about 2 s of rollout, which is within thermal drift.
 - FSDP `CPUOffloadPolicy` across multiple ranks is unverified — it needs
   `--ulimit memlock=-1` and has not been run to completion.
 - Training on NPU is untested.

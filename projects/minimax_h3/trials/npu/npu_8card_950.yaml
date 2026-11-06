@@ -11,6 +11,9 @@
 # - LoRA adapter merged into the base weights after placement. peft keeps it in
 #   fp32 as separate matmuls, about a quarter of every forward on Ascend.
 #   models.backbone.placement.plugins.0.enabled false runs it unmerged.
+# - Video decode split across the 4 cards of each SP group, 7 of each clip's
+#   28 decoder tiles per card (validation.decode_parallel, on by default).
+#   Decoding on the group's main card alone was ~47% of the wall clock.
 # - Text encoder stays FSDP-sharded (it runs once per prompt) but without CPU
 #   offload, which multi-rank Ascend runs cannot use without
 #   --ulimit memlock=-1.
