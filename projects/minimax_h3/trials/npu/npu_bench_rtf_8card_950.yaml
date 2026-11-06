@@ -1,9 +1,9 @@
 # RTF benchmark of the production build on 8x Ascend 950 (128 GiB per card).
 #
-# The production trial as README-NPU.md runs it -- 768x1376, 192 frames,
-# FSDP2 shard_size 8, Ulysses SP up_size 4, cpu_offload off -- with the engine
-# swapped for the RTF benchmark, so the 4 min 25 s headline splits into
-# encode / rollout / decode, warm vs cold, and a per-chunk profile.
+# npu_8card_950.yaml -- 768x1376, 192 frames, Ulysses SP up_size 4, DiT
+# replicated with the LoRA merged in -- with the engine swapped for the RTF
+# benchmark, so a clip's wall clock splits into encode / rollout / decode,
+# warm vs cold, plus a per-chunk profile.
 #
 #   ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 HCCL_NPU_SOCKET_PORT_RANGE=auto \
 #   N=8 bash tools/multi_run.sh projects/minimax_h3/trials/npu/npu_bench_rtf_8card_950.yaml
@@ -11,10 +11,13 @@
 # One-variable A/B runs against this baseline (change exactly one per run):
 #
 #   attention   RAVEN_NPU_FUSED_ATTN=0 in the environment -> the old SDPA fallback
-#   host queue  TASK_QUEUE_ENABLE=2 CPU_AFFINITY_CONF=1 in the environment
-#   FSDP        npu_bench_rtf_8card_950_replicated.yaml (DiT not sharded)
+#   LoRA        append: models.backbone.placement.plugins.0.enabled false
+#   FSDP        npu_bench_rtf_8card_950_fsdp.yaml (DiT sharded, adapter unmerged)
 #   op profile  append: benchmark.profile true
-__inherit__: projects/minimax_h3/trials/base/causal_minimax_h3_base/minimax_h3_raven_streaming_lora_4nfe_preview.yaml
+#
+# Iterations get slower as the cards heat up under sustained load, so compare
+# runs on the same iteration index, not only on the mean.
+__inherit__: npu_8card_950.yaml
 
 entry:
   module: projects.minimax_h3.tools.benchmark_rtf
@@ -23,20 +26,10 @@ entry:
 validation:
   num_prompts: 1
 
-models:
-  backbone:
-    placement:
-      fsdp:
-        cpu_offload: false
-  text_encoder:
-    placement:
-      fsdp:
-        cpu_offload: false
-
 benchmark:
   # The first pass pays CANN op compilation and allocator growth; discard it.
   warmup: 1
-  iters: 2
+  iters: 4
   decode: true
   per_chunk: true
   profile: false

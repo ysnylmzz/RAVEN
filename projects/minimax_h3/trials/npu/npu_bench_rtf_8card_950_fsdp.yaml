@@ -1,20 +1,29 @@
-# A/B against npu_bench_rtf_8card_950: the DiT placed whole on every card.
+# A/B against npu_bench_rtf_8card_950: the DiT FSDP2-sharded across all 8 cards.
 #
-# Under FSDP2 shard_size 8 with reshard_after_forward, every chunk forward
-# all-gathers the full ~66 GB bf16 trunk again -- 44+ forwards per clip. A
-# 128 GiB card holds the trunk outright, so this variant drops the sharding
-# and keeps only Ulysses SP; the difference in rollout time is what the
-# all-gathers cost.
+# This was the production placement before the 950 build switched to a
+# replicated DiT. With reshard_after_forward, every chunk forward all-gathers
+# the full ~66 GB bf16 trunk again (44+ forwards per clip); the rollout
+# difference against the baseline is what those all-gathers cost. Measured:
+# rollout 63.8 s here against 42.8 s replicated.
 #
-# Run it with the fused attention on (the default): with the SDPA fallback's
-# ~55 GiB of transient score matrices on top of a 66 GB trunk the card is at
-# its limit. Not yet run to completion -- unverified.
+# The LoRA merge needs whole weights, so the adapter runs unmerged here; for a
+# one-variable comparison, run the baseline with
+# models.backbone.placement.plugins.0.enabled false.
 #
 #   ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 HCCL_NPU_SOCKET_PORT_RANGE=auto \
-#   N=8 bash tools/multi_run.sh projects/minimax_h3/trials/npu/npu_bench_rtf_8card_950_replicated.yaml
+#   N=8 bash tools/multi_run.sh projects/minimax_h3/trials/npu/npu_bench_rtf_8card_950_fsdp.yaml
 __inherit__: npu_bench_rtf_8card_950.yaml
 
 models:
   backbone:
     placement:
-      fsdp: null
+      # The baseline sets fsdp: null, so the whole node is spelled out again
+      # (as in the base production trial, with cpu_offload off).
+      fsdp:
+        wrap_modules: [CausalMiniMaxH3DiTBlock]
+        param_dtype: null
+        reduce_dtype: float32
+        cast_forward_inputs: false
+        shard_size: 8
+        cpu_offload: false
+      plugins: []

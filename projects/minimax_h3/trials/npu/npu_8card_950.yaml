@@ -1,0 +1,36 @@
+# Production 8-card inference on Ascend 950 (128 GiB HBM per card).
+#
+# The base production trial (768x1376, 192 frames, Ulysses SP up_size 4) with
+# the placement the 950's memory allows:
+#
+# - DiT replicated on every card instead of FSDP-sharded. Under FSDP2 every
+#   chunk forward all-gathers the whole ~66 GB bf16 trunk again, which put a
+#   floor of ~0.9 s under each forward. Replicated, the RTF benchmark measured
+#   rollout 63.8 s -> 42.8 s and time to first chunk 5.6 s -> 2.7 s, at a
+#   92 GiB peak per card.
+# - LoRA adapter merged into the base weights after placement. peft keeps it in
+#   fp32 as separate matmuls, about a quarter of every forward on Ascend.
+#   models.backbone.placement.plugins.0.enabled false runs it unmerged.
+# - Text encoder stays FSDP-sharded (it runs once per prompt) but without CPU
+#   offload, which multi-rank Ascend runs cannot use without
+#   --ulimit memlock=-1.
+#
+#   ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 HCCL_NPU_SOCKET_PORT_RANGE=auto \
+#   N=8 bash tools/multi_run.sh projects/minimax_h3/trials/npu/npu_8card_950.yaml
+#
+# Do not add models.backbone.placement.fsdp.* overrides on the command line:
+# they recreate an fsdp node, and the merge plugin rejects sharded weights.
+__inherit__: projects/minimax_h3/trials/base/causal_minimax_h3_base/minimax_h3_raven_streaming_lora_4nfe_preview.yaml
+
+models:
+  backbone:
+    placement:
+      fsdp: null
+      plugins:
+        - module: common.plugin.lora_merge
+          class_name: MergeLoraAfterPlacement
+          enabled: true
+  text_encoder:
+    placement:
+      fsdp:
+        cpu_offload: false

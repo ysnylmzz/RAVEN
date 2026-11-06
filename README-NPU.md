@@ -27,8 +27,7 @@ FlashAttention is not available on NPU. For the cached streaming rollout
 `torch_npu.npu_fusion_attention` in TND layout. Everything else falls back to
 a per-document `scaled_dot_product_attention` path that materializes the score
 matrix. `RAVEN_NPU_FUSED_ATTN=0` forces that fallback for the rollout too.
-The figures under [Performance](#performance) were measured on the fallback,
-before the fused path existed.
+[Performance](#performance) has figures for both.
 
 ## Container
 
@@ -157,7 +156,8 @@ models load) and `PYTORCH_NPU_ALLOC_CONF=expandable_segments:True`.
 | `trials/npu/npu_4a_single_card.yaml` | 1 | Smoke test on a 64 GiB card. DiT and text encoder keep FSDP on a 1-rank mesh purely for CPU offload. 384×672. |
 | `trials/npu/npu_4a_single_card_950.yaml` | 1 | Same, for a 128 GiB card: the DiT is placed whole, with no FSDP and no collectives at all. |
 | `trials/npu/npu_4b_fsdp8_no_sp.yaml` | 8 | FSDP2 across 8 cards with Ulysses SP off. 384×672 — keep it there, see the note below. |
-| `trials/base/.../minimax_h3_raven_streaming_lora_4nfe_preview.yaml` | 8 | Production trial: 768×1376, FSDP2 `shard_size: 8` and SP `up_size: 4`. |
+| `trials/npu/npu_8card_950.yaml` | 8 | **Production on Ascend 950.** The base production trial with the DiT replicated on every card instead of FSDP-sharded, the LoRA merged into the base weights, and no CPU offload. 92 GiB peak per card. |
+| `trials/base/.../minimax_h3_raven_streaming_lora_4nfe_preview.yaml` | 8 | Base production trial: 768×1376, FSDP2 `shard_size: 8` and SP `up_size: 4`. On a 950 it is slower than the trial above; use it where the DiT does not fit a card. |
 
 Single card:
 
@@ -166,7 +166,27 @@ ASCEND_RT_VISIBLE_DEVICES=0 N=1 bash tools/multi_run.sh \
   projects/minimax_h3/trials/npu/npu_4a_single_card_950.yaml
 ```
 
-Eight cards, production settings:
+Eight cards, production settings on Ascend 950:
+
+```sh
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+HCCL_NPU_SOCKET_PORT_RANGE=auto \
+N=8 bash tools/multi_run.sh projects/minimax_h3/trials/npu/npu_8card_950.yaml
+```
+
+Under FSDP2 every chunk forward all-gathers the whole ~66 GB bf16 DiT trunk
+again, which puts a floor of about 0.9 s under each forward. A 128 GiB card
+holds the trunk outright, so this trial replicates it and keeps only Ulysses SP.
+Do not add `models.backbone.placement.fsdp.*` overrides to it: they recreate an
+fsdp node, and the LoRA merge refuses sharded weights.
+
+The LoRA merge (`common.plugin.lora_merge`) folds the adapter into the base
+weights once, after placement. peft keeps the adapter in fp32 as separate
+matmuls, and on Ascend that path took about a quarter of every forward. The
+merged weights differ from the unmerged path only by bf16 rounding. Append
+`models.backbone.placement.plugins.0.enabled false` to run the adapter unmerged.
+
+The FSDP-sharded build, for comparison or where the DiT does not fit a card:
 
 ```sh
 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
@@ -254,9 +274,34 @@ SDPA score matrices on top, and `npu-smi` reports around 80 GB because the
 caching allocator's reserved figure is a high-water mark that is never
 returned to the driver.
 
-Real-time factor is about 35×. The SDPA fallback is the bottleneck; replacing
-it with `npu_fusion_attention` is the main remaining optimization and would
-cut both the transient memory and the time.
+The figures above are from the SDPA fallback, before the fused attention path
+existed; its score matrices were the bottleneck.
+
+### Optimization steps
+
+RTF benchmark, 1 prompt, 192 frames (8.0 s of video), 1 warmup and 2–4
+measured iterations. RTF is generation wall clock divided by video length.
+Peak memory is the allocator's `max_memory_allocated`, not `npu-smi`.
+
+| Build | RTF | Rollout | Decode | Time to first chunk | Peak memory |
+| --- | --- | --- | --- | --- | --- |
+| FSDP, SDPA attention | 32.6 | 232.4 s | 27.9 s | 8.98 s | 48.0 GiB |
+| FSDP, fused attention | 11.6 | 63.8 s | 28.5 s | 5.63 s | 36.2 GiB |
+| Replicated DiT, fused attention | 9.0 | 42.8 s | 28.1 s | 2.66 s | 92.0 GiB |
+| + LoRA merged, contiguous KV merge (`npu_8card_950.yaml`) | not yet measured | | | | |
+
+The figures drift with card temperature. Under sustained load the cards in the
+validated machine reached 98 °C and every iteration after the first ran
+slower. The replicated build's first measured iteration took 35.0 s of
+rollout (RTF 7.2), and the later ones 43–47 s. Compare runs on the same
+iteration index, and watch `npu-smi info` while measuring.
+
+An op-level profile of one steady-state forward on the replicated build,
+before the last row's changes, split roughly as follows. Base matmuls took 29%
+and the fp32 LoRA path (matmuls, casts and adds) 26%. FlashAttention took 17%,
+the KV cache merge 11%, and the Ulysses all-to-all 6%. Decode runs the
+unsharded VAE on one card per SP group and is now about a third of the
+wall clock.
 
 ### Finding where the time goes
 
@@ -266,10 +311,11 @@ All three of these tools run on the real model build or at its real shapes:
   checks the fused kernel against SDPA on a ragged packing, then times both
   at the production per-rank shapes as the KV cache fills.
 - **Phase and chunk breakdown.**
-  `trials/npu/npu_bench_rtf_8card_950.yaml` is the production 8-card build
-  with the RTF engine. It splits encode / rollout / decode, discards a warmup
-  pass, and logs the backbone's parameter dtypes, LoRA adapter separately.
-  Its header lists the one-variable A/B runs.
+  `trials/npu/npu_bench_rtf_8card_950.yaml` is `npu_8card_950.yaml` with the
+  RTF engine. It splits encode / rollout / decode, discards a warmup pass,
+  and logs the backbone's parameter dtypes, LoRA adapter separately (empty
+  once merged). Its header lists the one-variable A/B runs.
+  `npu_bench_rtf_8card_950_fsdp.yaml` is the FSDP-sharded variant.
 - **Op-level trace.** Add `benchmark.profile true` to wrap one steady-state
   chunk in the `torch_npu` profiler. The trace is written under
   `benchmark/profile/rank0/` and opens in MindStudio Insight.
@@ -285,7 +331,11 @@ All three of these tools run on the real model build or at its real shapes:
 | `tools/multi_run.sh` | NPU branch: CANN env, `torch_npu` assertion, HCCL timeout, allocator config. conda and `venv/` made optional. |
 | `tools/prepare_venv_npu.sh`, `tools/environment-npu.yaml`, `tools/requirements-npu-inference.txt` | NPU environment build. |
 | `projects/minimax_h3/tools/check_autocast.py` | Verifies autocast device keying. |
-| `projects/minimax_h3/trials/npu/` | Bring-up trials. |
+| `utils/flash_attn.py` | Non-causal varlen attention routed to `torch_npu.npu_fusion_attention` (TND layout) on NPU. |
+| `projects/minimax_h3/modeling/transformer/causal_model*.py` | The cached rollout makes the new K/V contiguous before merging them with the cache; strided sources sent `index_put` down a slow path. |
+| `common/plugin/lora_merge.py` | Placement plugin that merges a LoRA adapter into the base weights for inference and unloads it. |
+| `projects/minimax_h3/tools/` | `bench_npu_attention` (attention microbenchmark) and `benchmark_rtf` (RTF engine). |
+| `projects/minimax_h3/trials/npu/` | Bring-up trials, the 950 production trial and the RTF benchmark trials. |
 
 ### The audio VAE width limit
 
@@ -345,8 +395,12 @@ Use the production trial rather than raising the resolution on
 ## Known gaps
 
 - `npu_fusion_attention` covers only the non-causal cached rollout. Causal
-  varlen attention still uses the SDPA fallback. The fused path has not yet
-  been timed end to end against the figures in [Performance](#performance).
+  varlen attention still uses the SDPA fallback.
+- The LoRA merge and the contiguous KV merge in `npu_8card_950.yaml` have not
+  yet been measured on hardware, nor has its video been compared with the
+  unmerged build.
+- Decode runs on one card per SP group while the others idle; it is about a
+  third of the wall clock on the 950 build.
 - FSDP `CPUOffloadPolicy` across multiple ranks is unverified — it needs
   `--ulimit memlock=-1` and has not been run to completion.
 - Training on NPU is untested.
