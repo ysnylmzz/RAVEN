@@ -319,6 +319,13 @@ class RTFBenchmarkEngine(BaseEngine):
                     if measured and index == warmup and device_module is not None:
                         device_module.reset_peak_memory_stats()
 
+                    # Decode runs on the SP main ranks only, so without this
+                    # the other ranks enter the next encode early and its
+                    # timer absorbs the wait for that decode: encode, and the
+                    # max-reduced total, came out ~one decode too long.
+                    timer.sync()
+                    ops.barrier()
+
                     phases: dict[str, float] = {}
                     rng = RandomState(
                         combine_seed(int(validation.seed), "benchmark", index, "backbone")
