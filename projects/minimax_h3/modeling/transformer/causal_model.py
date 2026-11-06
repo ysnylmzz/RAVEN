@@ -109,6 +109,12 @@ class CausalMiniMaxH3Attention(MiniMaxH3Attention):
         q, k = _apply_rope_qk(q, k, cos_sin_cache, positions)
 
         if past_key_values is not None:  # cached rollout: varlen flash attention
+            # v is a strided view of the fused qkv buffer. Scattering a strided
+            # source sends index_put down a slow path; see the SP subclass,
+            # where the same pattern was measured. For k, which the torch RoPE
+            # path already rebuilt, contiguous() is a no-op.
+            k = k.contiguous()
+            v = v.contiguous()
             if past_key_values.seq_lens(self.layer_idx) > 0:  # merge required
                 past_keys = past_key_values.key_cache[self.layer_idx]
                 past_values = past_key_values.value_cache[self.layer_idx]

@@ -139,6 +139,14 @@ class CausalMiniMaxH3AttentionSP(CausalMiniMaxH3Attention):
             # k/v are sequence-global and head-sharded here, and every index
             # below is a global row index, so the merge is the parent's with
             # local_heads in place of n.
+            #
+            # _ulysses_scatter_heads returns k and v as strided views of one
+            # [T_global, 3 * local_heads * d] buffer. A strided source sends
+            # index_put down a slow path: on Ascend 950 writing this chunk's
+            # 5220 rows took ~560 us per tensor against ~100 us to copy the 3x
+            # larger, contiguous cache. One copy each up front is far cheaper.
+            k = k.contiguous()
+            v = v.contiguous()
             if past_key_values.seq_lens(self.layer_idx) > 0:  # merge required
                 past_keys = past_key_values.key_cache[self.layer_idx]
                 past_values = past_key_values.value_cache[self.layer_idx]
