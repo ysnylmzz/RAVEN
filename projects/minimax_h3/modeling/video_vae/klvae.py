@@ -693,9 +693,22 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         pad_frames = self._decode_temporal_pad_frames(z, pad_tokens)
         return int(total_frames), int(pad_frames), int(total_frames - pad_frames)
 
+    # ===== JARVIS PATCH BEGIN(long video: the decoded clip can be written to another device, e.g. host memory, or not kept at all, so device memory does not grow with clip length) =====
+    # def _decode_temporal_streaming(
+    #     self, z, z_head, z_tail, num_chunks, pad_tokens, temporal_cat_dtype
+    # ):
     def _decode_temporal_streaming(
-        self, z, z_head, z_tail, num_chunks, pad_tokens, temporal_cat_dtype
+        self,
+        z,
+        z_head,
+        z_tail,
+        num_chunks,
+        pad_tokens,
+        temporal_cat_dtype,
+        output_device=None,
+        keep_output=True,
     ):
+    # ===== JARVIS PATCH END =====
         total_frames, pad_frames, output_frames = (
             self._decode_temporal_output_frame_plan(
                 z, z_head, z_tail, num_chunks, pad_tokens
@@ -722,18 +735,37 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             if part_frames <= 0:
                 return
             logical_frames += part_frames
-            if dec is None:
+            # ===== JARVIS PATCH BEGIN(long video: the decoded clip can be written to another device, e.g. host memory, or not kept at all, so device memory does not grow with clip length) =====
+            # if dec is None:
+            #     out_shape = list(part.shape)
+            #     out_shape[2] = output_frames
+            #     dec = torch.empty(out_shape, dtype=part.dtype, device=part.device)
+            #
+            # remaining = int(dec.shape[2]) - write_pos
+            # copy_frames = min(part_frames, max(0, remaining))
+            # if copy_frames > 0:
+            #     dec[:, :, write_pos : write_pos + copy_frames, :, :].copy_(
+            #         part[:, :, :copy_frames, :, :]
+            #     )
+            #     write_pos += copy_frames
+            if keep_output and dec is None:
                 out_shape = list(part.shape)
                 out_shape[2] = output_frames
-                dec = torch.empty(out_shape, dtype=part.dtype, device=part.device)
+                dec = torch.empty(
+                    out_shape,
+                    dtype=part.dtype,
+                    device=part.device if output_device is None else output_device,
+                )
 
-            remaining = int(dec.shape[2]) - write_pos
+            remaining = output_frames - write_pos
             copy_frames = min(part_frames, max(0, remaining))
             if copy_frames > 0:
-                dec[:, :, write_pos : write_pos + copy_frames, :, :].copy_(
-                    part[:, :, :copy_frames, :, :]
-                )
+                if keep_output:
+                    dec[:, :, write_pos : write_pos + copy_frames, :, :].copy_(
+                        part[:, :, :copy_frames, :, :]
+                    )
                 write_pos += copy_frames
+            # ===== JARVIS PATCH END =====
             dropped_frames += part_frames - copy_frames
 
         for i in range(num_chunks):
@@ -792,7 +824,10 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
 
             del clip_dec, clip_z
 
-        if dec is None:
+        # ===== JARVIS PATCH BEGIN(long video: the decoded clip can be written to another device, e.g. host memory, or not kept at all, so device memory does not grow with clip length) =====
+        # if dec is None:
+        if keep_output and dec is None:
+        # ===== JARVIS PATCH END =====
             raise RuntimeError("decode_temporal streaming produced no output tensor")
         if (
             logical_frames != total_frames
@@ -808,7 +843,10 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
 
         return dec
 
-    def decode_temporal(self, z):
+    # ===== JARVIS PATCH BEGIN(long video: the decoded clip can be written to another device, e.g. host memory, or not kept at all, so device memory does not grow with clip length) =====
+    # def decode_temporal(self, z):
+    def decode_temporal(self, z, output_device=None, keep_output=True):
+    # ===== JARVIS PATCH END =====
         chunk_dec = self.tokens_chunk_size * self.vae_ratio_t
 
         isolated_token_num = 0
@@ -847,9 +885,21 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
 
         temporal_cat_dtype = _resolve_temporal_cat_dtype()
         if not self.training and _resolve_temporal_stream_cat():
+            # ===== JARVIS PATCH BEGIN(long video: the decoded clip can be written to another device, e.g. host memory, or not kept at all, so device memory does not grow with clip length) =====
+            # return self._decode_temporal_streaming(
+            #     z, z_head, z_tail, num_chunks, pad_tokens, temporal_cat_dtype
+            # )
             return self._decode_temporal_streaming(
-                z, z_head, z_tail, num_chunks, pad_tokens, temporal_cat_dtype
+                z,
+                z_head,
+                z_tail,
+                num_chunks,
+                pad_tokens,
+                temporal_cat_dtype,
+                output_device=output_device,
+                keep_output=keep_output,
             )
+            # ===== JARVIS PATCH END =====
 
         decoded_tasks = []
         for i in range(num_chunks):
@@ -919,16 +969,49 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         if pad_frames > 0:
             dec = dec[:, :, :-pad_frames, :, :]
 
+        # ===== JARVIS PATCH BEGIN(long video: the decoded clip can be written to another device, e.g. host memory, or not kept at all, so device memory does not grow with clip length) =====
+        # The non-streaming path builds the whole clip on the decode device
+        # first, so here these only move or drop the finished result.
+        if not keep_output:
+            return None
+        if output_device is not None:
+            dec = dec.to(output_device)
+        # ===== JARVIS PATCH END =====
         return dec
 
-    def decode_base(self, z, frame_num=None, process_image=False):
+    # ===== JARVIS PATCH BEGIN(long video: the decoded clip can be written to another device, e.g. host memory, or not kept at all, so device memory does not grow with clip length) =====
+    # def decode_base(self, z, frame_num=None, process_image=False):
+    def decode_base(
+        self, z, frame_num=None, process_image=False, output_device=None, keep_output=True
+    ):
+        """``output_device`` receives the decoded frames (default: z's device).
+
+        A temporal decode writes each finished clip there as it goes, so with
+        ``torch.device("cpu")`` the accelerator never holds the whole video.
+        ``keep_output=False`` runs the decode -- its tile collectives included
+        -- and returns None; for ranks that only help a tile-parallel decode.
+        """
+    # ===== JARVIS PATCH END =====
         if process_image or not self.use_3d_conv:
             if not self.use_3d_conv and z.ndim == 5:
                 z = z.squeeze(2)
 
             recon = self._adaptive_decode(z)
+            # ===== JARVIS PATCH BEGIN(long video: the decoded clip can be written to another device, e.g. host memory, or not kept at all, so device memory does not grow with clip length) =====
+            if not keep_output:
+                return None
+            if output_device is not None:
+                recon = recon.to(output_device)
+            # ===== JARVIS PATCH END =====
         else:
-            recon = self.decode_temporal(z)
+            # ===== JARVIS PATCH BEGIN(long video: the decoded clip can be written to another device, e.g. host memory, or not kept at all, so device memory does not grow with clip length) =====
+            # recon = self.decode_temporal(z)
+            recon = self.decode_temporal(
+                z, output_device=output_device, keep_output=keep_output
+            )
+            if recon is None:
+                return None
+            # ===== JARVIS PATCH END =====
 
         if self.use_3d_conv:
             if frame_num is not None:

@@ -104,6 +104,12 @@ _AUDIO_TAG = 2
 # packing.py hard-codes _PATCH_H/_PATCH_W = 2 and the dataset's frame_rows
 # arithmetic divides by 2 on both spatial axes.
 _AUDIO_CHANNELS = 2
+# Whole-clip copies of the decoded video that can be live on the device at
+# once when it stays there: the decoder output, revert_tensor's rearranged,
+# normalized and contiguous tensors, then save_video's clamped/stacked ones.
+_DECODE_DEVICE_COPIES = 5
+# Frames per slice when the decoded clip is reverted in host memory.
+_REVERT_SLICE_FRAMES = 16
 _PATCH_SIZE = (1, 2, 2)
 
 
@@ -620,6 +626,7 @@ class CausalMiniMaxH3Base:
         saved_items: list[tuple[str, str, str, str]] = []
         fps = int(validation.get("fps", MINIMAX_H3_SUPPORTED_FPS))
         decode_group = self._decode_group(validation)
+        decode_to_host = validation.get("decode_to_host", None)
         try:
             for _, model in variants:
                 model.eval()
@@ -666,10 +673,14 @@ class CausalMiniMaxH3Base:
                         if decode_group is None and not is_group_main:
                             continue
                         frames, waveform = self._decode_latents(
-                            models, latents, index=index, decode_group=decode_group
+                            models,
+                            latents,
+                            index=index,
+                            decode_group=decode_group,
+                            keep=is_group_main,
+                            to_host=decode_to_host,
                         )
                         if not is_group_main:
-                            del frames, waveform
                             continue
                         name = f"validation/{variant_name}/prompt{entry['prompt_idx']:04d}.mp4"
                         path = media_dir / name
@@ -907,12 +918,35 @@ class CausalMiniMaxH3Base:
         return get_unified_parallel_group()
 
     @staticmethod
+    def _decode_to_host(video_vae: Any, video: torch.Tensor) -> bool:
+        """Whether the decoded clip is too large to keep on the device.
+
+        The clip is held whole several times over (see _DECODE_DEVICE_COPIES)
+        and grows with its length, while everything else at decode time is
+        fixed: a 60 s clip at 768x1376 is 17 GiB in fp32 per copy. The estimate
+        rounds the frame count up (4 frames per latent) and compares against
+        the free device memory plus the allocator's unused cache.
+        """
+        device_module = ops.get_device_module()
+        if device_module is None or video.device.type == "cpu":
+            return False
+        _, _, latent_t, latent_h, latent_w = video.shape
+        frames = latent_t * video_vae.vae_ratio_t
+        pixels = latent_h * latent_w * video_vae.vae_ratio**2
+        clip_bytes = 3 * frames * pixels * 4
+        free, _ = device_module.mem_get_info()
+        free += device_module.memory_reserved() - device_module.memory_allocated()
+        return _DECODE_DEVICE_COPIES * clip_bytes > free
+
+    @staticmethod
     def _decode_latents(
         models: dict[str, Any],
         latents: _RolloutX0s,
         index: int = 0,
         decode_group: Any = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        keep: bool = True,
+        to_host: bool | None = None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Normalized latents -> ``([1,3,F,H,W]`` in [0,1], ``[2, samples]``).
 
         Both VAEs carry their per-channel statistics as non-persistent buffers
@@ -924,8 +958,13 @@ class CausalMiniMaxH3Base:
 
         With ``decode_group`` (see ``_decode_group``) every rank of that group
         must call this with the same latents. The video decoder tiles are split
-        across the group and gathered, so every rank returns the full result;
-        the audio decode is small and simply runs on each of them.
+        across the group and gathered. A rank with ``keep=False`` takes part in
+        that and returns ``(None, None)``: it holds no frames and skips the
+        audio.
+
+        ``to_host`` writes the decoded frames to host memory clip by clip, so
+        the device never holds the whole video, and returns them on the CPU.
+        ``None`` decides by size (``_decode_to_host``); long clips need it.
         """
         video_vae = models["video_vae"]
         audio_vae = models["audio_vae"]
@@ -940,9 +979,30 @@ class CausalMiniMaxH3Base:
         video = video * video_vae.latents_std.to(video).view(
             1, -1, 1, 1, 1
         ) + video_vae.latents_mean.to(video).view(1, -1, 1, 1, 1)
-        with tile_parallel_group(decode_group):
-            decoded = video_vae.decode_base(video)
-        frames = video_vae.processor.revert_tensor(decoded)
+        if not keep:
+            with tile_parallel_group(decode_group):
+                video_vae.decode_base(video, keep_output=False)
+            return None, None
+
+        if to_host is None:
+            to_host = CausalMiniMaxH3Base._decode_to_host(video_vae, video)
+        if not to_host:
+            with tile_parallel_group(decode_group):
+                decoded = video_vae.decode_base(video)
+            frames = video_vae.processor.revert_tensor(decoded)
+        else:
+            with tile_parallel_group(decode_group):
+                frames = video_vae.decode_base(video, output_device=torch.device("cpu"))
+            logger.info(
+                "[decode] %d frames (%.1f GiB) decoded into host memory",
+                frames.shape[2], frames.numel() * frames.element_size() / 1024**3,
+            )
+            # Revert in place, a slice at a time on the device: whole, the
+            # rearrange/normalize/contiguous copies would triple the host
+            # footprint. Same elementwise ops, so the result is identical.
+            for start in range(0, frames.shape[2], _REVERT_SLICE_FRAMES):
+                piece = frames[:, :, start : start + _REVERT_SLICE_FRAMES]
+                piece.copy_(video_vae.processor.revert_tensor(piece.to(video.device)))
 
         # Stereo is two mono batch items, so the statistics broadcast over dim 1.
         audio = latents.audio[index]

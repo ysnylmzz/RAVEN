@@ -30,7 +30,10 @@ The phase split mirrors the production path:
     rollout  ``_rollout_latents``    (the 4-NFE causal chunk loop -- the DiT)
     decode   ``_decode_latents``     (video VAE + audio VAE; the video tiles are
                                       split across the SP group unless
-                                      validation.decode_parallel is false)
+                                      validation.decode_parallel is false, and
+                                      a clip too large for the device decodes
+                                      into host memory, see
+                                      validation.decode_to_host)
 
 ``_chunk_forward`` is additionally wrapped so the rollout's internal structure
 falls out: per-chunk latency and, for streaming, time-to-first-chunk -- when
@@ -291,6 +294,7 @@ class RTFBenchmarkEngine(BaseEngine):
         sp_size = meta._sp_size()
         is_group_main = ops.get_rank() % sp_size == 0
         decode_group = meta._decode_group(validation)
+        decode_to_host = validation.get("decode_to_host", None)
         logger.info(
             "[benchmark] video decode: %s",
             f"tiles split across the SP group ({sp_size} ranks)"
@@ -359,11 +363,17 @@ class RTFBenchmarkEngine(BaseEngine):
                     if want_decode and (is_group_main or decode_group is not None):
                         with timer.measure(phases, "decode"):
                             frames, waveform = meta._decode_latents(
-                                models, latents, index=0, decode_group=decode_group
+                                models,
+                                latents,
+                                index=0,
+                                decode_group=decode_group,
+                                keep=is_group_main,
+                                to_host=decode_to_host,
                             )
                         # Trust the decoder over the config for the clip length
-                        # the RTF divides by.
-                        decoded_frames = int(frames.shape[2])
+                        # the RTF divides by. Only the main ranks keep frames.
+                        if frames is not None:
+                            decoded_frames = int(frames.shape[2])
                         del frames, waveform
 
                     del latents, inputs

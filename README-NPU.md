@@ -242,10 +242,35 @@ prints the row count it actually needed, so one failed run tells you the
 answer.
 
 Long video is cheap. Streaming fixes each chunk at 5 video latents and bounds
-the KV cache by `sink` + `window_size`, so **memory does not grow with video
-length** — only time does, and close to linearly. Doubling 192 frames to 379
-doubled the chunk count from 11 to 22, cost 2.11× the wall time, and left the
-static footprint at 24.7 GiB unchanged.
+the KV cache by `sink` + `window_size`, so **the rollout's memory does not grow
+with video length** — only time does, and close to linearly. Doubling 192
+frames to 379 doubled the chunk count from 11 to 22, cost 2.11× the wall time,
+and left the static footprint at 24.7 GiB unchanged.
+
+The decoded video does grow with length: 3 × frames × 768 × 1376 fp32 values,
+17 GiB for 60 s. Kept on the card it is copied several times over on the way
+to the mp4, and a 60 s clip ran out of memory on top of the replicated DiT's
+78 GiB. So when the whole clip would not fit, the decoder writes each finished
+temporal clip straight into host memory, and only the rank that saves the
+video keeps it (`validation.decode_to_host`: unset decides by size, `true` or
+`false` forces it). Device memory then stays flat at any length. The cost
+moves to host RAM on the saving rank: about 4–5 copies of the clip while the
+mp4 is written, so roughly 50 GB for 40 s and 80 GB for 60 s.
+
+| Length | `validation.num_frames` | `max_seqlen` |
+| --- | --- | --- |
+| 8.0 s | 192 | 59464 (shipped) |
+| 15.8 s | 379 | 118000 |
+| 40.6 s | 974 | 302000 |
+| 60.4 s | 1450 | 448000 |
+
+```sh
+# 974 frames (40.6 s at 24 fps) on 8 cards
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 HCCL_NPU_SOCKET_PORT_RANGE=auto \
+N=8 bash tools/multi_run.sh projects/minimax_h3/trials/npu/npu_8card_950.yaml \
+  validation.num_frames 974 validation.num_prompts 1 \
+  data.args.max_seqlen 302000 data.args.max_seqlen_per_sample 302000
+```
 
 ```sh
 # 379 frames (15.8 s at 24 fps) on 8 cards
@@ -450,8 +475,9 @@ Use the production trial rather than raising the resolution on
   varlen attention still uses the SDPA fallback.
 - The SP-group decode has been checked for identical output on CPU only. On
   hardware the video has been generated but not compared frame by frame.
-- The audio VAE decode is not split: every rank of the SP group runs the same
-  one.
+- The audio VAE decode is not split; it runs on the rank that saves the video.
+- Decoding into host memory has been checked for identical output on CPU only,
+  and no clip longer than 15.8 s has been generated on hardware yet.
 - `npu_bench_rtf_8card_950_fsdp.yaml` has been measured with SP 4 only; it
   now inherits SP 8 and has not been run that way.
 - The contiguous KV merge has not been measured on its own. Comparing
