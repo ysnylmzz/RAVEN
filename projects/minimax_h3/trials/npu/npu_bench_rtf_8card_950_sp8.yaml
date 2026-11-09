@@ -1,0 +1,17 @@
+# A/B against npu_bench_rtf_8card_950: one SP group across all 8 cards
+# (npu_8card_950_sp8.yaml) instead of two groups of 4.
+#
+# The baseline's second group rolls out the same prompt as the first, so the
+# comparison is per-clip latency: rollout, decode and time to first chunk.
+#
+#   ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 HCCL_NPU_SOCKET_PORT_RANGE=auto \
+#   N=8 bash tools/multi_run.sh projects/minimax_h3/trials/npu/npu_bench_rtf_8card_950_sp8.yaml
+__inherit__: npu_bench_rtf_8card_950.yaml
+
+distributed:
+  up_size: [8]
+
+engine:
+  up_size:
+    train: 8
+    validation: 8

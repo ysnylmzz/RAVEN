@@ -157,6 +157,7 @@ models load) and `PYTORCH_NPU_ALLOC_CONF=expandable_segments:True`.
 | `trials/npu/npu_4a_single_card_950.yaml` | 1 | Same, for a 128 GiB card: the DiT is placed whole, with no FSDP and no collectives at all. |
 | `trials/npu/npu_4b_fsdp8_no_sp.yaml` | 8 | FSDP2 across 8 cards with Ulysses SP off. 384×672 — keep it there, see the note below. |
 | `trials/npu/npu_8card_950.yaml` | 8 | **Production on Ascend 950.** The base production trial with the DiT replicated on every card instead of FSDP-sharded, the LoRA merged into the base weights, and no CPU offload. 92 GiB peak per card. |
+| `trials/npu/npu_8card_950_sp8.yaml` | 8 | The production trial with one SP group across all 8 cards instead of two groups of 4. Lower latency for a single clip; prompts run one at a time. Not yet measured. |
 | `trials/base/.../minimax_h3_raven_streaming_lora_4nfe_preview.yaml` | 8 | Base production trial: 768×1376, FSDP2 `shard_size: 8` and SP `up_size: 4`. On a 950 it is slower than the trial above; use it where the DiT does not fit a card. |
 
 Single card:
@@ -290,6 +291,7 @@ Peak memory is the allocator's `max_memory_allocated`, not `npu-smi`.
 | Replicated DiT, fused attention | 9.0 | 42.8 s | 28.1 s | 2.66 s | 92.0 GiB |
 | + LoRA merged, contiguous KV merge | 7.8 | 32.4 s | 29.1 s | 1.74 s | 87.3 GiB |
 | + decode split across the SP group (`npu_8card_950.yaml`) | 4.8 | 29.4 s | 8.0 s | 1.76 s | 87.3 GiB |
+| SP across all 8 cards (`npu_8card_950_sp8.yaml`) | not yet measured | | | | |
 
 The figures drift with card temperature. Under sustained load the cards in the
 validated machine reached 98 °C and every iteration after the first ran
@@ -317,6 +319,16 @@ card decodes 7 and one all-gather per clip hands every card all 28. The
 output is the same as decoding on one card. `validation.decode_parallel false`
 restores the one-card decode.
 
+With `up_size: 4` the 8 cards form two SP groups, and each generates its own
+clip. For a single prompt the second group generates an unsaved duplicate
+(validation pads every group to the same number of prompts), so one clip only
+ever uses 4 cards. `npu_8card_950_sp8.yaml` puts all 8 in one group: each card
+holds 7 of the 56 heads and an eighth of the sequence rows, and the decode
+splits each clip's 28 tiles 4/4/4/4/3/3/3/3. It costs a wider all-to-all per
+attention layer. For a batch of prompts, two groups of 4 still finish two
+clips at a time, so SP 8 wins on throughput only if a clip takes less than half
+as long.
+
 Measured in one session against that switch, decode went from 28.9 s to
 8.0 s on average and from 22.6 s to 6.8 s on the first iteration (3.3x on
 four cards). The remainder is the audio decode, which is not split, and the
@@ -338,7 +350,8 @@ All three of these tools run on the real model build or at its real shapes:
   RTF engine. It splits encode / rollout / decode, discards a warmup pass,
   and logs the backbone's parameter dtypes, LoRA adapter separately (empty
   once merged). Its header lists the one-variable A/B runs.
-  `npu_bench_rtf_8card_950_fsdp.yaml` is the FSDP-sharded variant.
+  `npu_bench_rtf_8card_950_fsdp.yaml` is the FSDP-sharded variant, and
+  `npu_bench_rtf_8card_950_sp8.yaml` the one-group SP 8 variant.
 - **Op-level trace.** Add `benchmark.profile true` to wrap one steady-state
   chunk in the `torch_npu` profiler. The trace is written under
   `benchmark/profile/rank0/` and opens in MindStudio Insight.

@@ -15,6 +15,7 @@
 #   LoRA        append: models.backbone.placement.plugins.0.enabled false
 #   decode      append: validation.decode_parallel false (one card per SP group)
 #   FSDP        npu_bench_rtf_8card_950_fsdp.yaml (DiT sharded, adapter unmerged)
+#   SP 8        npu_bench_rtf_8card_950_sp8.yaml (one SP group of 8 cards)
 #   op profile  append: benchmark.profile true
 #
 # Iterations get slower as the cards heat up under sustained load, so compare

@@ -1,0 +1,24 @@
+# npu_8card_950.yaml with Ulysses SP across all 8 cards instead of two groups
+# of 4.
+#
+# With two groups, each group generates its own clip. For a single clip the
+# second group runs an unsaved duplicate (validation pads every group to the
+# same number of prompts), so half the machine does no useful work. Here all
+# 8 cards share one clip: each holds 7 of the 56 attention heads and 1/8 of
+# the sequence rows, and the video decode splits each clip's 28 tiles 8 ways.
+#
+# This lowers the latency of one clip. Prompts run one after another instead
+# of two at a time, so for a batch of clips it only wins on throughput if a
+# clip takes less than half as long as with npu_8card_950.yaml.
+#
+#   ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 HCCL_NPU_SOCKET_PORT_RANGE=auto \
+#   N=8 bash tools/multi_run.sh projects/minimax_h3/trials/npu/npu_8card_950_sp8.yaml
+__inherit__: npu_8card_950.yaml
+
+distributed:
+  up_size: [8]
+
+engine:
+  up_size:
+    train: 8
+    validation: 8
