@@ -289,7 +289,7 @@ Peak memory is the allocator's `max_memory_allocated`, not `npu-smi`.
 | FSDP, fused attention | 11.6 | 63.8 s | 28.5 s | 5.63 s | 36.2 GiB |
 | Replicated DiT, fused attention | 9.0 | 42.8 s | 28.1 s | 2.66 s | 92.0 GiB |
 | + LoRA merged, contiguous KV merge | 7.8 | 32.4 s | 29.1 s | 1.74 s | 87.3 GiB |
-| + decode split across the SP group (`npu_8card_950.yaml`) | not yet measured | | | | |
+| + decode split across the SP group (`npu_8card_950.yaml`) | 4.8 | 29.4 s | 8.0 s | 1.76 s | 87.3 GiB |
 
 The figures drift with card temperature. Under sustained load the cards in the
 validated machine reached 98 °C and every iteration after the first ran
@@ -316,6 +316,15 @@ all four. At 768x1376 each temporal clip is 4 x 7 = 28 decoder tiles, so each
 card decodes 7 and one all-gather per clip hands every card all 28. The
 output is the same as decoding on one card. `validation.decode_parallel false`
 restores the one-card decode.
+
+Measured in one session against that switch, decode went from 28.9 s to
+8.0 s on average and from 22.6 s to 6.8 s on the first iteration (3.3x on
+four cards). The remainder is the audio decode, which is not split, and the
+per-clip all-gathers. RTF went from 7.8 to 4.8, the first iteration's clip
+from 48.7 s to 32.7 s (RTF 4.1), and peak memory stayed at 87.3 GiB. Rollout
+is unchanged: 25.3 s against 25.4 s on the first iteration. Its lower mean
+in the last row only reflects the cards heating less between the shorter
+iterations.
 
 ### Finding where the time goes
 
@@ -412,8 +421,8 @@ Use the production trial rather than raising the resolution on
 
 - `npu_fusion_attention` covers only the non-causal cached rollout. Causal
   varlen attention still uses the SDPA fallback.
-- The SP-group decode has been checked for identical output on CPU only. It
-  has not yet been timed on hardware.
+- The SP-group decode has been checked for identical output on CPU only. On
+  hardware the video has been generated but not compared frame by frame.
 - The audio VAE decode is not split: every rank of the SP group runs the same
   one.
 - The contiguous KV merge has not been measured on its own. Comparing
