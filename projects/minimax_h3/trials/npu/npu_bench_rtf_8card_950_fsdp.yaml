@@ -7,8 +7,9 @@
 # with SP up_size 4 and the adapter unmerged on both sides: rollout 63.8 s
 # here against 42.8 s replicated.
 #
-# The adapter runs unmerged in fp32 here, as in the baseline. The LoRA plugins
-# need whole weights, so the plugin list is cleared.
+# The LoRA plugins need whole weights, so the plugin list is cleared and the
+# adapter runs in fp32 here; for a one-variable comparison, run the baseline
+# with models.backbone.placement.plugins.0.enabled false.
 #
 #   ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 HCCL_NPU_SOCKET_PORT_RANGE=auto \
 #   N=8 bash tools/multi_run.sh projects/minimax_h3/trials/npu/npu_bench_rtf_8card_950_fsdp.yaml

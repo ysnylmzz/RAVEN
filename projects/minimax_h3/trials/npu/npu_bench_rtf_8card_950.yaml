@@ -1,7 +1,7 @@
 # RTF benchmark of the production build on 8x Ascend 950 (128 GiB per card).
 #
 # npu_8card_950.yaml -- 768x1376, 192 frames, one Ulysses SP group across all
-# 8 cards, DiT replicated with the LoRA unmerged in fp32, video decode split
+# 8 cards, DiT replicated with the LoRA unmerged in bf16, video decode split
 # across the group -- with the engine swapped for the RTF benchmark, so a clip's wall
 # clock splits into encode / rollout / decode, warm vs cold, plus a per-chunk
 # profile.
@@ -12,7 +12,7 @@
 # One-variable A/B runs against this baseline (change exactly one per run):
 #
 #   attention   RAVEN_NPU_FUSED_ATTN=0 in the environment -> the old SDPA fallback
-#   LoRA bf16   append: models.backbone.placement.plugins.0.enabled true
+#   LoRA fp32   append: models.backbone.placement.plugins.0.enabled false
 #   LoRA merge  append: models.backbone.placement.plugins.0.class_name MergeLoraAfterPlacement
 #               models.backbone.placement.plugins.0.enabled true (speed only:
 #               it degrades clips past 8 s)

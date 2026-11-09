@@ -1,8 +1,7 @@
 # Production 8-card inference on Ascend 950 (128 GiB HBM per card).
 #
 # The base production trial (768x1376, 192 frames) with the placement the
-# 950's memory allows. Measured with the LoRA merged: RTF 2.6, 20.6 s per 8 s
-# clip. The merge is no longer used (see below), which costs some of that.
+# 950's memory allows. Measured: RTF 2.7, 21.5 s per 8 s clip, 89.7 GiB peak.
 #
 # - Ulysses SP across all 8 cards (up_size 8) instead of the base trial's two
 #   groups of 4. With two groups, a single clip only ever used 4 cards while
@@ -14,13 +13,12 @@
 #   floor of ~0.9 s under each forward. Replicated, the RTF benchmark measured
 #   rollout 63.8 s -> 42.8 s and time to first chunk 5.6 s -> 2.7 s, at a
 #   92 GiB peak per card.
-# - LoRA adapter unmerged, in fp32 as peft builds it. Merging it into the bf16
-#   weights saved about a quarter of every forward, but clips longer than the
-#   trained 8 s degraded after 8 s with the merge and stayed clean without it.
-#   models.backbone.placement.plugins.0.enabled true casts the adapter to bf16
-#   instead (CastLoraAfterPlacement), which removes the fp32 matmuls and casts
-#   while keeping the weights intact. Neither its speed nor a long clip with it
-#   has been measured yet, so it is off.
+# - LoRA adapter unmerged but cast to bf16 (CastLoraAfterPlacement). peft keeps
+#   it in fp32 as separate matmuls; in bf16 a steady chunk takes 1.48 s instead
+#   of 1.69 s (RTF 3.0 -> 2.7), and a 15.8 s clip stays clean. Do not merge the
+#   adapter into the weights instead: that was 1.41 s per chunk, but clips past
+#   the trained 8 s degraded from 8 s on.
+#   models.backbone.placement.plugins.0.enabled false runs the fp32 adapter.
 # - Video decode split across the SP group, at most 4 of each clip's 28
 #   decoder tiles per card (validation.decode_parallel, on by default).
 #   Decoding on one card per group took ~47% of the wall clock.
@@ -50,7 +48,7 @@ models:
       plugins:
         - module: common.plugin.lora_merge
           class_name: CastLoraAfterPlacement
-          enabled: false
+          enabled: true
   text_encoder:
     placement:
       fsdp:

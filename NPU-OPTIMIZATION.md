@@ -1,7 +1,7 @@
 # MiniMax-H3 streaming inference on Ascend 950: what made it fast
 
 This is the record of how one 8-second, 768×1376 clip went from **261 s to
-21 s** on 8× Ascend 950: 12.6× faster end to end. It covers each change, what
+21.5 s** on 8× Ascend 950: 12.2× faster end to end. It covers each change, what
 it fixed, how it was measured, and how to switch it off to check. For how to
 run things, see [README-NPU.md](README-NPU.md).
 
@@ -21,8 +21,9 @@ would be real time. Every row adds one change to the row before it.
 
 Rows 3–5 include the LoRA merge, which was later withdrawn because it degrades
 clips longer than 8 s (see [step 3](#step-3-merge-the-lora-and-fix-the-kv-cache-merge-rollout-43-s--32-s)).
-The current default runs the adapter unmerged and is slower than row 5 by the
-merge's share; it has not been benchmarked yet.
+The production build replaces it with the adapter unmerged in bf16: **RTF 2.7,
+21.5 s per clip**, rollout 16.3 s, decode 4.5 s, time to first chunk 1.31 s,
+89.7 GiB peak. End to end that is 12.2× faster than row 0.
 
 All rows: RTF benchmark, one prompt, 192 frames, 1 warmup and 2–4 measured
 iterations, means across iterations. Encode (the text encoder, about 0.65 s)
@@ -34,7 +35,7 @@ by iteration (see [Measuring it](#measuring-it)). Their means therefore
 include some slowdown that row 5 does not have. On the first iteration alone,
 row 3 → 4 → 5 went 48.5 s → 32.7 s → 20.2 s per clip.
 
-Where the time goes now: rollout 75%, decode 22%, encode 3%.
+Where the time goes in the production build: rollout 76%, decode 21%, encode 3%.
 
 ## What a clip costs
 
@@ -129,11 +130,21 @@ The test layer above used a delta far larger than a real adapter's. Rounding
 `W`, so the merged model carries a fixed perturbation that every token and
 every chunk sees. Why that only shows up past 8 s is not proven.
 
-The production trial therefore runs the adapter unmerged in fp32 again, and
-gives up this step's LoRA gain. `CastLoraAfterPlacement` in the same file is
-the candidate replacement: it casts the unmerged adapter to bf16, so the
-weights stay exact. Its speed and long-clip quality are still to be measured
-(`models.backbone.placement.plugins.0.enabled true`).
+**Replacement: the adapter unmerged in bf16.** `CastLoraAfterPlacement` in the
+same file keeps the adapter unmerged and casts it to bf16, so the base weights
+stay exact and only the adapter branch's arithmetic is rounded. That removes
+the fp32 matmuls and casts, which were the cost. A 15.8 s clip with it stayed
+clean. Measured in one session at SP 8 (after step 5):
+
+| LoRA adapter | RTF | Seconds per clip | Rollout | Steady chunk | Peak memory |
+| --- | --- | --- | --- | --- | --- |
+| fp32, unmerged | 3.0 | 24.2 | 18.8 s | 1.69 s | 92.0 GiB |
+| bf16, unmerged | 2.7 | 21.5 | 16.3 s | 1.48 s | 89.7 GiB |
+| merged (step 5 session) | 2.6 | 20.6 | 15.4 s | 1.41 s | 87.3 GiB |
+
+The bf16 adapter keeps about three quarters of the merge's gain. It is the
+production setting; `models.backbone.placement.plugins.0.enabled false` runs
+the fp32 adapter.
 
 ## Step 4: decode on every card of the group (decode 29 s → 8 s)
 
@@ -218,7 +229,7 @@ the same iteration index, measure A/B pairs in one session, and check
 
 ## What is left
 
-Rollout is 75% of a clip, at about 0.28 s per forward on 8 cards.
+Rollout is 76% of a clip, at about 0.30 s per forward on 8 cards.
 
 1. **Profile the one-group build.** The breakdown above is from the two-group
    build before the LoRA merge. A fresh `benchmark.profile true` run shows
@@ -242,5 +253,6 @@ Rollout is 75% of a clip, at about 0.28 s per forward on 8 cards.
 | `npu-rollout-opt` | `de303e0` KV merge, `734534a` LoRA merge plugin, `3ce8ca2` replicated 950 trial | 2, 3 |
 | `npu-parallel-decode` | `d880595` group decode, `a0fc46d` and `89bae55` measurements | 4 |
 | `npu-sp8` | `352a523` SP 8 trials, `5e88bef` SP 8 as the default | 5 |
+| `npu-long-video` | `cd52633` host-memory decode, `2966203` BigVGAN conv chunking, `4ced83e` merge withdrawn and bf16 adapter added, then bf16 adapter as the default | long clips, step 3 replacement |
 
-Each branch builds on the one above it, so `npu-sp8` contains everything.
+Each branch builds on the one above it, so `npu-long-video` contains everything.

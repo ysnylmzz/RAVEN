@@ -156,7 +156,7 @@ models load) and `PYTORCH_NPU_ALLOC_CONF=expandable_segments:True`.
 | `trials/npu/npu_4a_single_card.yaml` | 1 | Smoke test on a 64 GiB card. DiT and text encoder keep FSDP on a 1-rank mesh purely for CPU offload. 384×672. |
 | `trials/npu/npu_4a_single_card_950.yaml` | 1 | Same, for a 128 GiB card: the DiT is placed whole, with no FSDP and no collectives at all. |
 | `trials/npu/npu_4b_fsdp8_no_sp.yaml` | 8 | FSDP2 across 8 cards with Ulysses SP off. 384×672 — keep it there, see the note below. |
-| `trials/npu/npu_8card_950.yaml` | 8 | **Production on Ascend 950.** The base production trial with one SP group across all 8 cards, the DiT replicated on every card instead of FSDP-sharded, the LoRA adapter unmerged in fp32, and no CPU offload. With the LoRA merged it measured RTF 2.6 (an 8 s clip in 20.6 s, 87 GiB peak per card), but the merge degrades clips longer than 8 s and is off; the unmerged build has not been benchmarked at SP 8. |
+| `trials/npu/npu_8card_950.yaml` | 8 | **Production on Ascend 950.** The base production trial with one SP group across all 8 cards, the DiT replicated on every card instead of FSDP-sharded, the LoRA adapter unmerged in bf16, and no CPU offload. RTF 2.7: an 8 s clip in 21.5 s. 90 GiB peak per card. |
 | `trials/npu/npu_8card_950_sp4.yaml` | 8 | The same with two SP groups of 4, which run two prompts at a time. A single clip takes about twice as long (RTF 4.8). |
 | `trials/base/.../minimax_h3_raven_streaming_lora_4nfe_preview.yaml` | 8 | Base production trial: 768×1376, FSDP2 `shard_size: 8` and SP `up_size: 4`. On a 950 it is slower than the trial above; use it where the DiT does not fit a card. |
 
@@ -184,7 +184,7 @@ fsdp node, and the LoRA cast plugin refuses sharded weights.
 
 peft keeps the LoRA adapter in fp32 as separate matmuls, and on Ascend that
 path took about a quarter of every forward. `common.plugin.lora_merge` has two
-ways to cut it, and the trial uses neither by default:
+ways to cut it:
 
 - `MergeLoraAfterPlacement` folds the adapter into the bf16 base weights. It is
   the fastest, but it breaks long clips: with it, 15.8 s and 40.6 s clips
@@ -195,8 +195,17 @@ ways to cut it, and the trial uses neither by default:
   if at all.
 - `CastLoraAfterPlacement` keeps the adapter unmerged and casts it to bf16, so
   the weights stay exact and only the adapter branch's arithmetic is rounded.
-  Append `models.backbone.placement.plugins.0.enabled true` to turn it on. Its
-  speed and its long-clip quality have not been measured yet.
+  The production trial uses it. A 15.8 s clip with it stayed clean, and it
+  recovers about three quarters of the merge's speed. Append
+  `models.backbone.placement.plugins.0.enabled false` for the fp32 adapter.
+
+Measured in one session with the RTF benchmark (192 frames, 4 iterations):
+
+| LoRA adapter | RTF | Seconds per clip | Rollout | Steady chunk | Time to first chunk | Peak memory | Clips past 8 s |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| fp32, unmerged (peft default) | 3.0 | 24.2 | 18.8 s | 1.69 s | 1.49 s | 92.0 GiB | clean |
+| **bf16, unmerged (production)** | **2.7** | **21.5** | **16.3 s** | **1.48 s** | **1.31 s** | **89.7 GiB** | **clean** |
+| merged into bf16 weights (earlier session) | 2.6 | 20.6 | 15.4 s | 1.41 s | 1.16 s | 87.3 GiB | degraded from 8 s |
 
 The FSDP-sharded build, for comparison or where the DiT does not fit a card:
 
@@ -327,9 +336,10 @@ Peak memory is the allocator's `max_memory_allocated`, not `npu-smi`.
 | Replicated DiT, fused attention | 9.0 | 42.8 s | 28.1 s | 2.66 s | 92.0 GiB |
 | + LoRA merged, contiguous KV merge | 7.8 | 32.4 s | 29.1 s | 1.74 s | 87.3 GiB |
 | + decode split across the SP group | 4.8 | 29.4 s | 8.0 s | 1.76 s | 87.3 GiB |
-| + one SP group of 8 cards instead of two of 4 (`npu_8card_950.yaml`) | 2.6 | 15.4 s | 4.6 s | 1.16 s | 87.3 GiB |
+| + one SP group of 8 cards instead of two of 4 | 2.6 | 15.4 s | 4.6 s | 1.16 s | 87.3 GiB |
+| LoRA unmerged in bf16 instead of merged (`npu_8card_950.yaml`) | 2.7 | 16.3 s | 4.5 s | 1.31 s | 89.7 GiB |
 
-Every row above the last ran two SP groups of 4. Each row adds one change to
+Every row above the last two ran two SP groups of 4. Each row adds one change to
 the row before it. [NPU-OPTIMIZATION.md](NPU-OPTIMIZATION.md) walks through the
 changes and how each was measured.
 
@@ -348,8 +358,8 @@ The same build with the merge turned off measured RTF 8.6,
 rollout 39.8 s and peak memory 92.0 GiB. Its total was about 7 s higher on
 every iteration, so the merge alone saves about 18% of rollout and the
 4.7 GiB of the fp32 adapter. The merge was later found to degrade clips
-longer than 8 s and is no longer used, so the figures from that row on are
-faster than the current default; see the LoRA notes under
+longer than 8 s. The last row replaces it with the bf16 adapter, which costs
+about 0.9 s per clip against it; see the LoRA notes under
 [Choosing a trial](#choosing-a-trial).
 
 An op-level profile of one steady-state forward on the replicated build,
@@ -399,8 +409,7 @@ All three of these tools run on the real model build or at its real shapes:
 - **Phase and chunk breakdown.**
   `trials/npu/npu_bench_rtf_8card_950.yaml` is `npu_8card_950.yaml` with the
   RTF engine. It splits encode / rollout / decode, discards a warmup pass,
-  and logs the backbone's parameter dtypes, LoRA adapter separately (empty
-  once merged). Its header lists the one-variable A/B runs.
+  and logs the backbone's parameter dtypes, LoRA adapter separately. Its header lists the one-variable A/B runs.
   `npu_bench_rtf_8card_950_fsdp.yaml` is the FSDP-sharded variant, and
   `npu_bench_rtf_8card_950_sp4.yaml` the two-group variant.
 - **Op-level trace.** Add `benchmark.profile true` to wrap one steady-state
@@ -495,11 +504,9 @@ Use the production trial rather than raising the resolution on
 - The SP-group decode has been checked for identical output on CPU only. On
   hardware the video has been generated but not compared frame by frame.
 - The audio VAE decode is not split; it runs on the rank that saves the video.
-- The production trial runs the LoRA adapter unmerged in fp32. It has not
-  been benchmarked at SP 8, and the bf16 adapter cast has been checked on CPU
-  only.
 - Why the merge breaks clips past 8 s is not proven. The bisect isolated it:
   merge off was the only change between a degraded and a clean 15.8 s clip.
+- The bf16 adapter has been checked on a 15.8 s clip, not yet on 40 s.
 - Decoding into host memory has been checked for identical output on CPU only,
   and no clip longer than 15.8 s has been generated on hardware yet.
 - `npu_bench_rtf_8card_950_fsdp.yaml` has been measured with SP 4 only; it
