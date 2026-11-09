@@ -1,0 +1,20 @@
+# npu_8card_950.yaml with the base trial's two Ulysses SP groups of 4 cards
+# instead of one group of 8.
+#
+# Each group generates its own clip, so a batch of prompts runs two at a time.
+# A single clip is slower: measured RTF 4.8 (rollout 25.5 s, decode 6.9 s on
+# the first iteration) against 2.6 with one group of 8, and every run got
+# slower iteration by iteration. For a single prompt the second group
+# generates an unsaved duplicate.
+#
+#   ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 HCCL_NPU_SOCKET_PORT_RANGE=auto \
+#   N=8 bash tools/multi_run.sh projects/minimax_h3/trials/npu/npu_8card_950_sp4.yaml
+__inherit__: npu_8card_950.yaml
+
+distributed:
+  up_size: [4]
+
+engine:
+  up_size:
+    train: 4
+    validation: 4

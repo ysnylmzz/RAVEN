@@ -3,8 +3,9 @@
 # This was the production placement before the 950 build switched to a
 # replicated DiT. With reshard_after_forward, every chunk forward all-gathers
 # the full ~66 GB bf16 trunk again (44+ forwards per clip); the rollout
-# difference against the baseline is what those all-gathers cost. Measured:
-# rollout 63.8 s here against 42.8 s replicated.
+# difference against the baseline is what those all-gathers cost. Measured
+# with SP up_size 4 and the adapter unmerged on both sides: rollout 63.8 s
+# here against 42.8 s replicated.
 #
 # The LoRA merge needs whole weights, so the adapter runs unmerged here; for a
 # one-variable comparison, run the baseline with

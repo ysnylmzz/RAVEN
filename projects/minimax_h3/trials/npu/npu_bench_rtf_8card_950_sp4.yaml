@@ -1,0 +1,18 @@
+# A/B against npu_bench_rtf_8card_950: two Ulysses SP groups of 4 cards
+# (npu_8card_950_sp4.yaml) instead of one group of 8.
+#
+# The second group rolls out the same prompt as the first, so the comparison
+# is per-clip latency: rollout, decode and time to first chunk. Measured:
+# RTF 4.84 against 2.58.
+#
+#   ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 HCCL_NPU_SOCKET_PORT_RANGE=auto \
+#   N=8 bash tools/multi_run.sh projects/minimax_h3/trials/npu/npu_bench_rtf_8card_950_sp4.yaml
+__inherit__: npu_bench_rtf_8card_950.yaml
+
+distributed:
+  up_size: [4]
+
+engine:
+  up_size:
+    train: 4
+    validation: 4

@@ -1,8 +1,13 @@
 # Production 8-card inference on Ascend 950 (128 GiB HBM per card).
 #
-# The base production trial (768x1376, 192 frames, Ulysses SP up_size 4) with
-# the placement the 950's memory allows:
+# The base production trial (768x1376, 192 frames) with the placement the
+# 950's memory allows. Measured: RTF 2.6, 20.6 s per 8 s clip.
 #
+# - Ulysses SP across all 8 cards (up_size 8) instead of the base trial's two
+#   groups of 4. With two groups, a single clip only ever used 4 cards while
+#   the other group generated an unsaved duplicate. One group of 8 measured
+#   rollout 25.5 s -> 15.1 s and time to first chunk 1.76 s -> 1.16 s.
+#   npu_8card_950_sp4.yaml keeps two groups, which run two prompts at a time.
 # - DiT replicated on every card instead of FSDP-sharded. Under FSDP2 every
 #   chunk forward all-gathers the whole ~66 GB bf16 trunk again, which put a
 #   floor of ~0.9 s under each forward. Replicated, the RTF benchmark measured
@@ -11,9 +16,9 @@
 # - LoRA adapter merged into the base weights after placement. peft keeps it in
 #   fp32 as separate matmuls, about a quarter of every forward on Ascend.
 #   models.backbone.placement.plugins.0.enabled false runs it unmerged.
-# - Video decode split across the 4 cards of each SP group, 7 of each clip's
-#   28 decoder tiles per card (validation.decode_parallel, on by default).
-#   Decoding on the group's main card alone was ~47% of the wall clock.
+# - Video decode split across the SP group, at most 4 of each clip's 28
+#   decoder tiles per card (validation.decode_parallel, on by default).
+#   Decoding on one card per group took ~47% of the wall clock.
 # - Text encoder stays FSDP-sharded (it runs once per prompt) but without CPU
 #   offload, which multi-rank Ascend runs cannot use without
 #   --ulimit memlock=-1.
@@ -24,6 +29,14 @@
 # Do not add models.backbone.placement.fsdp.* overrides on the command line:
 # they recreate an fsdp node, and the merge plugin rejects sharded weights.
 __inherit__: projects/minimax_h3/trials/base/causal_minimax_h3_base/minimax_h3_raven_streaming_lora_4nfe_preview.yaml
+
+distributed:
+  up_size: [8]
+
+engine:
+  up_size:
+    train: 8
+    validation: 8
 
 models:
   backbone:

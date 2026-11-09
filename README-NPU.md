@@ -156,8 +156,8 @@ models load) and `PYTORCH_NPU_ALLOC_CONF=expandable_segments:True`.
 | `trials/npu/npu_4a_single_card.yaml` | 1 | Smoke test on a 64 GiB card. DiT and text encoder keep FSDP on a 1-rank mesh purely for CPU offload. 384×672. |
 | `trials/npu/npu_4a_single_card_950.yaml` | 1 | Same, for a 128 GiB card: the DiT is placed whole, with no FSDP and no collectives at all. |
 | `trials/npu/npu_4b_fsdp8_no_sp.yaml` | 8 | FSDP2 across 8 cards with Ulysses SP off. 384×672 — keep it there, see the note below. |
-| `trials/npu/npu_8card_950.yaml` | 8 | **Production on Ascend 950.** The base production trial with the DiT replicated on every card instead of FSDP-sharded, the LoRA merged into the base weights, and no CPU offload. 92 GiB peak per card. |
-| `trials/npu/npu_8card_950_sp8.yaml` | 8 | The production trial with one SP group across all 8 cards instead of two groups of 4. Lower latency for a single clip; prompts run one at a time. Not yet measured. |
+| `trials/npu/npu_8card_950.yaml` | 8 | **Production on Ascend 950.** The base production trial with one SP group across all 8 cards, the DiT replicated on every card instead of FSDP-sharded, the LoRA merged into the base weights, and no CPU offload. RTF 2.6: an 8 s clip in 20.6 s. 87 GiB peak per card. |
+| `trials/npu/npu_8card_950_sp4.yaml` | 8 | The same with two SP groups of 4, which run two prompts at a time. A single clip takes about twice as long (RTF 4.8). |
 | `trials/base/.../minimax_h3_raven_streaming_lora_4nfe_preview.yaml` | 8 | Base production trial: 768×1376, FSDP2 `shard_size: 8` and SP `up_size: 4`. On a 950 it is slower than the trial above; use it where the DiT does not fit a card. |
 
 Single card:
@@ -177,7 +177,8 @@ N=8 bash tools/multi_run.sh projects/minimax_h3/trials/npu/npu_8card_950.yaml
 
 Under FSDP2 every chunk forward all-gathers the whole ~66 GB bf16 DiT trunk
 again, which puts a floor of about 0.9 s under each forward. A 128 GiB card
-holds the trunk outright, so this trial replicates it and keeps only Ulysses SP.
+holds the trunk outright, so this trial replicates it and keeps only Ulysses SP,
+across all 8 cards.
 Do not add `models.backbone.placement.fsdp.*` overrides to it: they recreate an
 fsdp node, and the LoRA merge refuses sharded weights.
 
@@ -290,15 +291,22 @@ Peak memory is the allocator's `max_memory_allocated`, not `npu-smi`.
 | FSDP, fused attention | 11.6 | 63.8 s | 28.5 s | 5.63 s | 36.2 GiB |
 | Replicated DiT, fused attention | 9.0 | 42.8 s | 28.1 s | 2.66 s | 92.0 GiB |
 | + LoRA merged, contiguous KV merge | 7.8 | 32.4 s | 29.1 s | 1.74 s | 87.3 GiB |
-| + decode split across the SP group (`npu_8card_950.yaml`) | 4.8 | 29.4 s | 8.0 s | 1.76 s | 87.3 GiB |
-| SP across all 8 cards (`npu_8card_950_sp8.yaml`) | not yet measured | | | | |
+| + decode split across the SP group | 4.8 | 29.4 s | 8.0 s | 1.76 s | 87.3 GiB |
+| + one SP group of 8 cards instead of two of 4 (`npu_8card_950.yaml`) | 2.6 | 15.4 s | 4.6 s | 1.16 s | 87.3 GiB |
 
-The figures drift with card temperature. Under sustained load the cards in the
-validated machine reached 98 °C and every iteration after the first ran
+Every row above the last ran two SP groups of 4. Each row adds one change to
+the row before it. [NPU-OPTIMIZATION.md](NPU-OPTIMIZATION.md) walks through the
+changes and how each was measured.
+
+With two SP groups the figures drift. Under sustained load the cards in the
+validated machine reached 98 °C, and every iteration after the first ran
 slower. The replicated build's first measured iteration took 35.0 s of
 rollout (RTF 7.2), and the later ones 43–47 s. With the LoRA merged, rollout
 went from 25.3 s on the first iteration to 37.6 s on the fourth, and decode
-from 22.5 s to 31.7 s. Compare runs on the same iteration index, and watch
+from 22.5 s to 31.7 s. One SP group of 8 did not drift: its four iterations
+took 20.2–21.1 s, and the two-group run straight after it drifted from 33.0 s
+to 47.1 s again. Both keep all 8 cards busy, so temperature alone may not
+explain the drift. Compare runs on the same iteration index, and watch
 `npu-smi info` while measuring.
 
 The same build with the merge turned off
@@ -322,12 +330,18 @@ restores the one-card decode.
 With `up_size: 4` the 8 cards form two SP groups, and each generates its own
 clip. For a single prompt the second group generates an unsaved duplicate
 (validation pads every group to the same number of prompts), so one clip only
-ever uses 4 cards. `npu_8card_950_sp8.yaml` puts all 8 in one group: each card
+ever uses 4 cards. `npu_8card_950.yaml` now puts all 8 in one group: each card
 holds 7 of the 56 heads and an eighth of the sequence rows, and the decode
 splits each clip's 28 tiles 4/4/4/4/3/3/3/3. It costs a wider all-to-all per
-attention layer. For a batch of prompts, two groups of 4 still finish two
-clips at a time, so SP 8 wins on throughput only if a clip takes less than half
-as long.
+attention layer.
+
+Measured in one session against `npu_bench_rtf_8card_950_sp4.yaml`, on the
+first iteration, rollout went from 25.5 s to 15.1 s (1.69x), decode from 6.9 s
+to 4.5 s, and time to first chunk from 1.76 s to 1.16 s. A steady-state chunk
+takes 1.41 s, or 0.28 s per forward. RTF went from 4.8 to 2.6. For a batch of
+prompts the two layouts are about even: two groups finished two clips in
+33–47 s (16.5–23.5 s each), and one group finishes one in 20.6 s. Use
+`npu_8card_950_sp4.yaml` for batch throughput.
 
 Measured in one session against that switch, decode went from 28.9 s to
 8.0 s on average and from 22.6 s to 6.8 s on the first iteration (3.3x on
@@ -351,7 +365,7 @@ All three of these tools run on the real model build or at its real shapes:
   and logs the backbone's parameter dtypes, LoRA adapter separately (empty
   once merged). Its header lists the one-variable A/B runs.
   `npu_bench_rtf_8card_950_fsdp.yaml` is the FSDP-sharded variant, and
-  `npu_bench_rtf_8card_950_sp8.yaml` the one-group SP 8 variant.
+  `npu_bench_rtf_8card_950_sp4.yaml` the two-group variant.
 - **Op-level trace.** Add `benchmark.profile true` to wrap one steady-state
   chunk in the `torch_npu` profiler. The trace is written under
   `benchmark/profile/rank0/` and opens in MindStudio Insight.
@@ -438,6 +452,8 @@ Use the production trial rather than raising the resolution on
   hardware the video has been generated but not compared frame by frame.
 - The audio VAE decode is not split: every rank of the SP group runs the same
   one.
+- `npu_bench_rtf_8card_950_fsdp.yaml` has been measured with SP 4 only; it
+  now inherits SP 8 and has not been run that way.
 - The contiguous KV merge has not been measured on its own. Comparing
   sessions puts it at about 2 s of rollout, which is within thermal drift.
 - FSDP `CPUOffloadPolicy` across multiple ranks is unverified — it needs

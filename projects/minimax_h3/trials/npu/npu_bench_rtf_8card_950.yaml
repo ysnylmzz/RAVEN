@@ -1,10 +1,10 @@
 # RTF benchmark of the production build on 8x Ascend 950 (128 GiB per card).
 #
-# npu_8card_950.yaml -- 768x1376, 192 frames, Ulysses SP up_size 4, DiT
-# replicated with the LoRA merged in, video decode split across each SP
-# group -- with the engine swapped for the RTF
-# benchmark, so a clip's wall clock splits into encode / rollout / decode,
-# warm vs cold, plus a per-chunk profile.
+# npu_8card_950.yaml -- 768x1376, 192 frames, one Ulysses SP group across all
+# 8 cards, DiT replicated with the LoRA merged in, video decode split across
+# the group -- with the engine swapped for the RTF benchmark, so a clip's wall
+# clock splits into encode / rollout / decode, warm vs cold, plus a per-chunk
+# profile.
 #
 #   ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 HCCL_NPU_SOCKET_PORT_RANGE=auto \
 #   N=8 bash tools/multi_run.sh projects/minimax_h3/trials/npu/npu_bench_rtf_8card_950.yaml
@@ -15,11 +15,12 @@
 #   LoRA        append: models.backbone.placement.plugins.0.enabled false
 #   decode      append: validation.decode_parallel false (one card per SP group)
 #   FSDP        npu_bench_rtf_8card_950_fsdp.yaml (DiT sharded, adapter unmerged)
-#   SP 8        npu_bench_rtf_8card_950_sp8.yaml (one SP group of 8 cards)
+#   SP 4        npu_bench_rtf_8card_950_sp4.yaml (two SP groups of 4 cards)
 #   op profile  append: benchmark.profile true
 #
-# Iterations get slower as the cards heat up under sustained load, so compare
-# runs on the same iteration index, not only on the mean.
+# With two SP groups, every run so far got slower iteration by iteration (up to
+# ~45% by the fourth); one group of 8 stayed flat. Compare runs on the same
+# iteration index, not only on the mean.
 __inherit__: npu_8card_950.yaml
 
 entry:
