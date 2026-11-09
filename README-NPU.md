@@ -195,8 +195,8 @@ ways to cut it:
   if at all.
 - `CastLoraAfterPlacement` keeps the adapter unmerged and casts it to bf16, so
   the weights stay exact and only the adapter branch's arithmetic is rounded.
-  The production trial uses it. A 15.8 s clip with it stayed clean, and it
-  recovers about three quarters of the merge's speed. Append
+  The production trial uses it. 15.8 s and 40.6 s clips with it stayed clean,
+  and it recovers about three quarters of the merge's speed. Append
   `models.backbone.placement.plugins.0.enabled false` for the fp32 adapter.
 
 Measured in one session with the RTF benchmark (192 frames, 4 iterations):
@@ -276,6 +276,11 @@ video keeps it (`validation.decode_to_host`: unset decides by size, `true` or
 moves to host RAM on the saving rank: about 4–5 copies of the clip while the
 mp4 is written, so roughly 50 GB for 40 s and 80 GB for 60 s.
 
+With `npu_8card_950.yaml`, a 40.6 s clip (974 frames) came out clean end to
+end. Rollout and decode took 1 min 59 s after the models were built, and the
+video was saved 25 s later, 2 min 24 s in all. The 974 frames went to host
+memory (11.5 GiB). 60.4 s has not been run since the host decode was added.
+
 | Length | `validation.num_frames` | `max_seqlen` |
 | --- | --- | --- |
 | 8.0 s | 192 | 59464 (shipped) |
@@ -294,10 +299,7 @@ N=8 bash tools/multi_run.sh projects/minimax_h3/trials/npu/npu_8card_950.yaml \
 ```sh
 # 379 frames (15.8 s at 24 fps) on 8 cards
 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 HCCL_NPU_SOCKET_PORT_RANGE=auto \
-N=8 bash tools/multi_run.sh \
-  projects/minimax_h3/trials/base/causal_minimax_h3_base/minimax_h3_raven_streaming_lora_4nfe_preview.yaml \
-  models.backbone.placement.fsdp.cpu_offload false \
-  models.text_encoder.placement.fsdp.cpu_offload false \
+N=8 bash tools/multi_run.sh projects/minimax_h3/trials/npu/npu_8card_950.yaml \
   validation.num_frames 379 validation.num_prompts 1 \
   data.args.max_seqlen 118000 data.args.max_seqlen_per_sample 118000
 ```
@@ -306,11 +308,21 @@ N=8 bash tools/multi_run.sh \
 
 Measured on 8× Ascend 950, CANN 9.1.0, 768×1376, `cpu_offload false`.
 
+Base trial (FSDP2, two SP groups of 4, SDPA attention, before the
+optimizations below):
+
 | Run | Frames | Video length | Rollout + decode | Static memory |
 | --- | --- | --- | --- | --- |
 | 1 prompt | 192 | 8.0 s | 4 min 25 s | 24.7 GiB |
 | 1 prompt | 379 | 15.8 s | 9 min 19 s | 24.7 GiB |
 | 4 prompts, 2 SP groups | 192 | 8.0 s each | 9 min 35 s | 24.7 GiB |
+
+Production trial (`npu_8card_950.yaml`):
+
+| Run | Frames | Video length | Rollout + decode | Peak memory |
+| --- | --- | --- | --- | --- |
+| 1 prompt, RTF benchmark | 192 | 8.0 s | 20.8 s | 89.7 GiB |
+| 1 prompt | 974 | 40.6 s | 1 min 59 s | decoded to host memory |
 
 Model build adds roughly 110–130 s on top, dominated by reading DiT weights.
 
@@ -454,7 +466,8 @@ rate: its residual-block convolutions and `conv_post` cross 1,000,000 samples
 at about 31 s, and the last upsampling layer at about 62 s. A 40.6 s clip
 failed there (`Conv2DV2 ... [2,8,1,1298400]`). `bigvgan.py` now calls those
 layers through `npu_conv1d` / `npu_conv_transpose1d`, the same chunking with
-dilation, padding and bias handled, and only when the input is too wide.
+dilation, padding and bias handled, and only when the input is too wide. With
+them the 40.6 s clip's audio decodes.
 
 ## Troubleshooting
 
@@ -506,9 +519,12 @@ Use the production trial rather than raising the resolution on
 - The audio VAE decode is not split; it runs on the rank that saves the video.
 - Why the merge breaks clips past 8 s is not proven. The bisect isolated it:
   merge off was the only change between a degraded and a clean 15.8 s clip.
-- The bf16 adapter has been checked on a 15.8 s clip, not yet on 40 s.
-- Decoding into host memory has been checked for identical output on CPU only,
-  and no clip longer than 15.8 s has been generated on hardware yet.
+- Decoding into host memory has been checked for identical output on CPU
+  only. On hardware a 40.6 s clip decoded this way looks clean but has not been
+  compared frame by frame.
+- 60.4 s has not been generated since the host decode and the BigVGAN
+  chunking were added; at that length the last upsampling layer also needs
+  chunking, which is in place but unexercised.
 - `npu_bench_rtf_8card_950_fsdp.yaml` has been measured with SP 4 only; it
   now inherits SP 8 and has not been run that way.
 - The contiguous KV merge has not been measured on its own. Comparing

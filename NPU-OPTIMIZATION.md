@@ -133,8 +133,8 @@ every chunk sees. Why that only shows up past 8 s is not proven.
 **Replacement: the adapter unmerged in bf16.** `CastLoraAfterPlacement` in the
 same file keeps the adapter unmerged and casts it to bf16, so the base weights
 stay exact and only the adapter branch's arithmetic is rounded. That removes
-the fp32 matmuls and casts, which were the cost. A 15.8 s clip with it stayed
-clean. Measured in one session at SP 8 (after step 5):
+the fp32 matmuls and casts, which were the cost. 15.8 s and 40.6 s clips with
+it stayed clean. Measured in one session at SP 8 (after step 5):
 
 | LoRA adapter | RTF | Seconds per clip | Rollout | Steady chunk | Peak memory |
 | --- | --- | --- | --- | --- | --- |
