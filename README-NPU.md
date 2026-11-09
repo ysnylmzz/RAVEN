@@ -156,7 +156,7 @@ models load) and `PYTORCH_NPU_ALLOC_CONF=expandable_segments:True`.
 | `trials/npu/npu_4a_single_card.yaml` | 1 | Smoke test on a 64 GiB card. DiT and text encoder keep FSDP on a 1-rank mesh purely for CPU offload. 384×672. |
 | `trials/npu/npu_4a_single_card_950.yaml` | 1 | Same, for a 128 GiB card: the DiT is placed whole, with no FSDP and no collectives at all. |
 | `trials/npu/npu_4b_fsdp8_no_sp.yaml` | 8 | FSDP2 across 8 cards with Ulysses SP off. 384×672 — keep it there, see the note below. |
-| `trials/npu/npu_8card_950.yaml` | 8 | **Production on Ascend 950.** The base production trial with one SP group across all 8 cards, the DiT replicated on every card instead of FSDP-sharded, the LoRA merged into the base weights, and no CPU offload. RTF 2.6: an 8 s clip in 20.6 s. 87 GiB peak per card. |
+| `trials/npu/npu_8card_950.yaml` | 8 | **Production on Ascend 950.** The base production trial with one SP group across all 8 cards, the DiT replicated on every card instead of FSDP-sharded, the LoRA adapter unmerged in fp32, and no CPU offload. With the LoRA merged it measured RTF 2.6 (an 8 s clip in 20.6 s, 87 GiB peak per card), but the merge degrades clips longer than 8 s and is off; the unmerged build has not been benchmarked at SP 8. |
 | `trials/npu/npu_8card_950_sp4.yaml` | 8 | The same with two SP groups of 4, which run two prompts at a time. A single clip takes about twice as long (RTF 4.8). |
 | `trials/base/.../minimax_h3_raven_streaming_lora_4nfe_preview.yaml` | 8 | Base production trial: 768×1376, FSDP2 `shard_size: 8` and SP `up_size: 4`. On a 950 it is slower than the trial above; use it where the DiT does not fit a card. |
 
@@ -180,13 +180,23 @@ again, which puts a floor of about 0.9 s under each forward. A 128 GiB card
 holds the trunk outright, so this trial replicates it and keeps only Ulysses SP,
 across all 8 cards.
 Do not add `models.backbone.placement.fsdp.*` overrides to it: they recreate an
-fsdp node, and the LoRA merge refuses sharded weights.
+fsdp node, and the LoRA cast plugin refuses sharded weights.
 
-The LoRA merge (`common.plugin.lora_merge`) folds the adapter into the base
-weights once, after placement. peft keeps the adapter in fp32 as separate
-matmuls, and on Ascend that path took about a quarter of every forward. The
-merged weights differ from the unmerged path only by bf16 rounding. Append
-`models.backbone.placement.plugins.0.enabled false` to run the adapter unmerged.
+peft keeps the LoRA adapter in fp32 as separate matmuls, and on Ascend that
+path took about a quarter of every forward. `common.plugin.lora_merge` has two
+ways to cut it, and the trial uses neither by default:
+
+- `MergeLoraAfterPlacement` folds the adapter into the bf16 base weights. It is
+  the fastest, but it breaks long clips: with it, 15.8 s and 40.6 s clips
+  degraded from about 8 s on (the trained length), while the same 15.8 s clip
+  with the adapter unmerged stayed clean. Rounding `W + B·A` to bf16 drops every
+  delta element smaller than half a bf16 step of `W`, so the merged model is a
+  fixed perturbation of the trained one. Use it only for clips of 8 s or less,
+  if at all.
+- `CastLoraAfterPlacement` keeps the adapter unmerged and casts it to bf16, so
+  the weights stay exact and only the adapter branch's arithmetic is rounded.
+  Append `models.backbone.placement.plugins.0.enabled true` to turn it on. Its
+  speed and its long-clip quality have not been measured yet.
 
 The FSDP-sharded build, for comparison or where the DiT does not fit a card:
 
@@ -334,11 +344,13 @@ to 47.1 s again. Both keep all 8 cards busy, so temperature alone may not
 explain the drift. Compare runs on the same iteration index, and watch
 `npu-smi info` while measuring.
 
-The same build with the merge turned off
-(`models.backbone.placement.plugins.0.enabled false`) measured RTF 8.6,
+The same build with the merge turned off measured RTF 8.6,
 rollout 39.8 s and peak memory 92.0 GiB. Its total was about 7 s higher on
 every iteration, so the merge alone saves about 18% of rollout and the
-4.7 GiB of the fp32 adapter.
+4.7 GiB of the fp32 adapter. The merge was later found to degrade clips
+longer than 8 s and is no longer used, so the figures from that row on are
+faster than the current default; see the LoRA notes under
+[Choosing a trial](#choosing-a-trial).
 
 An op-level profile of one steady-state forward on the replicated build,
 before the last row's changes, split roughly as follows. Base matmuls took 29%
@@ -408,7 +420,7 @@ All three of these tools run on the real model build or at its real shapes:
 | `projects/minimax_h3/tools/check_autocast.py` | Verifies autocast device keying. |
 | `utils/flash_attn.py` | Non-causal varlen attention routed to `torch_npu.npu_fusion_attention` (TND layout) on NPU. |
 | `projects/minimax_h3/modeling/transformer/causal_model*.py` | The cached rollout makes the new K/V contiguous before merging them with the cache; strided sources sent `index_put` down a slow path. |
-| `common/plugin/lora_merge.py` | Placement plugin that merges a LoRA adapter into the base weights for inference and unloads it. |
+| `common/plugin/lora_merge.py` | Placement plugins for inference: `CastLoraAfterPlacement` runs the adapter unmerged in bf16, `MergeLoraAfterPlacement` folds it into the base weights (degrades clips past 8 s). |
 | `projects/minimax_h3/modeling/video_vae/klvae.py` | `tile_parallel_group(group)` replaces the unvendored sglang decode-parallel state, so the released tile-parallel decode runs over a torch process group. |
 | `projects/minimax_h3/meta_models/causal_minimax_h3_base.py` | Validation decodes on every rank of the SP group with the tiles split between them (`validation.decode_parallel`, on by default); the group's main rank still writes the video. |
 | `projects/minimax_h3/tools/` | `bench_npu_attention` (attention microbenchmark) and `benchmark_rtf` (RTF engine). |
@@ -483,6 +495,11 @@ Use the production trial rather than raising the resolution on
 - The SP-group decode has been checked for identical output on CPU only. On
   hardware the video has been generated but not compared frame by frame.
 - The audio VAE decode is not split; it runs on the rank that saves the video.
+- The production trial runs the LoRA adapter unmerged in fp32. It has not
+  been benchmarked at SP 8, and the bf16 adapter cast has been checked on CPU
+  only.
+- Why the merge breaks clips past 8 s is not proven. The bisect isolated it:
+  merge off was the only change between a degraded and a clean 15.8 s clip.
 - Decoding into host memory has been checked for identical output on CPU only,
   and no clip longer than 15.8 s has been generated on hardware yet.
 - `npu_bench_rtf_8card_950_fsdp.yaml` has been measured with SP 4 only; it

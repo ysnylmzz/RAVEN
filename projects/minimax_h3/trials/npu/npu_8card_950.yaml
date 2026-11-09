@@ -1,7 +1,8 @@
 # Production 8-card inference on Ascend 950 (128 GiB HBM per card).
 #
 # The base production trial (768x1376, 192 frames) with the placement the
-# 950's memory allows. Measured: RTF 2.6, 20.6 s per 8 s clip.
+# 950's memory allows. Measured with the LoRA merged: RTF 2.6, 20.6 s per 8 s
+# clip. The merge is no longer used (see below), which costs some of that.
 #
 # - Ulysses SP across all 8 cards (up_size 8) instead of the base trial's two
 #   groups of 4. With two groups, a single clip only ever used 4 cards while
@@ -13,9 +14,13 @@
 #   floor of ~0.9 s under each forward. Replicated, the RTF benchmark measured
 #   rollout 63.8 s -> 42.8 s and time to first chunk 5.6 s -> 2.7 s, at a
 #   92 GiB peak per card.
-# - LoRA adapter merged into the base weights after placement. peft keeps it in
-#   fp32 as separate matmuls, about a quarter of every forward on Ascend.
-#   models.backbone.placement.plugins.0.enabled false runs it unmerged.
+# - LoRA adapter unmerged, in fp32 as peft builds it. Merging it into the bf16
+#   weights saved about a quarter of every forward, but clips longer than the
+#   trained 8 s degraded after 8 s with the merge and stayed clean without it.
+#   models.backbone.placement.plugins.0.enabled true casts the adapter to bf16
+#   instead (CastLoraAfterPlacement), which removes the fp32 matmuls and casts
+#   while keeping the weights intact. Neither its speed nor a long clip with it
+#   has been measured yet, so it is off.
 # - Video decode split across the SP group, at most 4 of each clip's 28
 #   decoder tiles per card (validation.decode_parallel, on by default).
 #   Decoding on one card per group took ~47% of the wall clock.
@@ -27,7 +32,7 @@
 #   N=8 bash tools/multi_run.sh projects/minimax_h3/trials/npu/npu_8card_950.yaml
 #
 # Do not add models.backbone.placement.fsdp.* overrides on the command line:
-# they recreate an fsdp node, and the merge plugin rejects sharded weights.
+# they recreate an fsdp node, and the cast plugin rejects sharded weights.
 __inherit__: projects/minimax_h3/trials/base/causal_minimax_h3_base/minimax_h3_raven_streaming_lora_4nfe_preview.yaml
 
 distributed:
@@ -44,8 +49,8 @@ models:
       fsdp: null
       plugins:
         - module: common.plugin.lora_merge
-          class_name: MergeLoraAfterPlacement
-          enabled: true
+          class_name: CastLoraAfterPlacement
+          enabled: false
   text_encoder:
     placement:
       fsdp:

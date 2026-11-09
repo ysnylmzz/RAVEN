@@ -19,6 +19,11 @@ would be real time. Every row adds one change to the row before it.
 | 4 | Video decode split across the SP group | 4.8 | 38.1 | 29.4 s | 8.0 s | 1.76 s | 87.3 GiB | 1.63× |
 | 5 | One SP group of 8 cards instead of two of 4 | **2.6** | **20.6** | **15.4 s** | **4.6 s** | **1.16 s** | 87.3 GiB | 1.85× |
 
+Rows 3–5 include the LoRA merge, which was later withdrawn because it degrades
+clips longer than 8 s (see [step 3](#step-3-merge-the-lora-and-fix-the-kv-cache-merge-rollout-43-s--32-s)).
+The current default runs the adapter unmerged and is slower than row 5 by the
+merge's share; it has not been benchmarked yet.
+
 All rows: RTF benchmark, one prompt, 192 frames, 1 warmup and 2–4 measured
 iterations, means across iterations. Encode (the text encoder, about 0.65 s)
 is included in seconds per clip but not shown. Peak memory is the allocator's
@@ -115,9 +120,20 @@ switched off in the same build, RTF was 8.6 against 7.8, about 7 s more per
 clip on every iteration. The KV fix is worth about 2 s of rollout, but that is
 an estimate across two sessions, within the drift.
 
-**Check it.** `models.backbone.placement.plugins.0.enabled false` runs the
-adapter unmerged. The benchmark logs the backbone's parameter dtypes, and
-after the merge the adapter entry is empty.
+**Withdrawn: the merge breaks clips longer than 8 s.** The 8 s clips looked
+right, but every clip generated with the merge past the trained length, at
+15.8 s and 40.6 s, degraded from about 8 s on. A bisect isolated it: with the
+merge turned off and nothing else changed, the same 15.8 s clip stayed clean.
+The test layer above used a delta far larger than a real adapter's. Rounding
+`W + B·A` to bf16 drops every delta element smaller than half a bf16 step of
+`W`, so the merged model carries a fixed perturbation that every token and
+every chunk sees. Why that only shows up past 8 s is not proven.
+
+The production trial therefore runs the adapter unmerged in fp32 again, and
+gives up this step's LoRA gain. `CastLoraAfterPlacement` in the same file is
+the candidate replacement: it casts the unmerged adapter to bf16, so the
+weights stay exact. Its speed and long-clip quality are still to be measured
+(`models.backbone.placement.plugins.0.enabled true`).
 
 ## Step 4: decode on every card of the group (decode 29 s → 8 s)
 
