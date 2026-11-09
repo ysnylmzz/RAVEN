@@ -9,7 +9,7 @@ import torch.nn as nn
 from torch.nn import Conv1d, ConvTranspose1d, Parameter
 from torch.nn.utils.parametrizations import weight_norm
 
-from .alias_free import Activation1d
+from .alias_free import Activation1d, npu_conv1d, npu_conv_transpose1d
 
 
 def get_padding(kernel_size, dilation=1):
@@ -142,9 +142,9 @@ class AMPBlock1(torch.nn.Module):
             a1 = next(activation_iter)
             a2 = next(activation_iter)
             xt = a1(x)
-            xt = c1(xt)
+            xt = npu_conv1d(c1, xt)
             xt = a2(xt)
-            xt = c2(xt)
+            xt = npu_conv1d(c2, xt)
             x = xt.add_(x)
 
         return x
@@ -233,7 +233,7 @@ class BigVGAN(torch.nn.Module):
         for i in range(self.num_upsamples):
             # Upsampling
             for i_up in range(len(self.ups[i])):
-                x = self.ups[i][i_up](x)
+                x = npu_conv_transpose1d(self.ups[i][i_up], x)
             # AMP blocks
             xs = None
             for j in range(self.num_kernels):
@@ -245,7 +245,7 @@ class BigVGAN(torch.nn.Module):
 
         # Post-conv
         x = self.activation_post(x)
-        x = self.conv_post(x)
+        x = npu_conv1d(self.conv_post, x)
         # Final tanh activation
         if self.use_tanh_at_final:
             x.tanh_()

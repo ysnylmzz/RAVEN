@@ -14,34 +14,40 @@ _NPU_CONV1D_CHUNK_SIZE = 500_000
 _NPU_CONV1D_WIDTH_LIMIT = 1_000_000
 
 
-def _npu_chunked_conv1d(x, weight, *, stride: int, groups: int):
+def _npu_chunked_conv1d(
+    x, weight, *, stride: int, groups: int, dilation: int = 1, bias=None
+):
     """Valid 1D convolution in overlapping chunks aligned to output indices.
 
     ``x`` has already been padded, if requested by the caller. This is
-    equivalent to ``F.conv1d(x, weight, stride=stride, groups=groups)``
-    apart from potential backend floating-point rounding differences.
+    equivalent to ``F.conv1d(x, weight, bias, stride=stride,
+    dilation=dilation, groups=groups)`` apart from potential backend
+    floating-point rounding differences.
     """
-    kernel_size = weight.shape[-1]
+    # Input samples one output reads: the kernel spread out by the dilation.
+    span = dilation * (weight.shape[-1] - 1) + 1
     if stride <= 0:
         raise ValueError("stride must be positive")
-    if kernel_size > _NPU_CONV1D_CHUNK_SIZE:
+    if span > _NPU_CONV1D_CHUNK_SIZE:
         raise ValueError("kernel is larger than the NPU convolution chunk size")
 
-    output_length = (x.shape[-1] - kernel_size) // stride + 1
+    def conv(chunk):
+        return F.conv1d(
+            chunk, weight, bias, stride=stride, dilation=dilation, groups=groups
+        )
+
+    output_length = (x.shape[-1] - span) // stride + 1
     if output_length <= 0:
         # Match the usual PyTorch error for an input shorter than the kernel.
-        return F.conv1d(x, weight, stride=stride, groups=groups)
+        return conv(x)
 
-    outputs_per_chunk = (_NPU_CONV1D_CHUNK_SIZE - kernel_size) // stride + 1
+    outputs_per_chunk = (_NPU_CONV1D_CHUNK_SIZE - span) // stride + 1
     pieces = []
     for output_start in range(0, output_length, outputs_per_chunk):
         output_end = min(output_start + outputs_per_chunk, output_length)
         input_start = output_start * stride
-        input_end = (output_end - 1) * stride + kernel_size
-        input_chunk = x[..., input_start:input_end].contiguous()
-        pieces.append(
-            F.conv1d(input_chunk, weight, stride=stride, groups=groups)
-        )
+        input_end = (output_end - 1) * stride + span
+        pieces.append(conv(x[..., input_start:input_end].contiguous()))
 
     return torch.cat(pieces, dim=-1)
 
@@ -82,6 +88,48 @@ def _npu_chunked_conv_transpose1d(x, weight, *, stride: int, groups: int):
         output_start = input_start * stride
         out[..., output_start : output_start + piece.shape[-1]] += piece
 
+    return out
+
+
+def _npu_too_wide(x: torch.Tensor, width: int) -> bool:
+    return x.device.type == "npu" and width > _NPU_CONV1D_WIDTH_LIMIT
+
+
+def npu_conv1d(module: nn.Conv1d, x: torch.Tensor) -> torch.Tensor:
+    """``module(x)``, in chunks on NPU when the padded input is too wide.
+
+    BigVGAN's last stage runs at the full sample rate, so its convolutions
+    cross CANN's width limit at about 31 s of 32 kHz audio.
+    """
+    (pad,) = module.padding
+    if not _npu_too_wide(x, x.shape[-1] + 2 * pad):
+        return module(x)
+    if module.padding_mode != "zeros":
+        raise NotImplementedError(f"padding_mode {module.padding_mode!r}")
+    return _npu_chunked_conv1d(
+        F.pad(x, (pad, pad)),
+        module.weight,
+        stride=module.stride[0],
+        groups=module.groups,
+        dilation=module.dilation[0],
+        bias=module.bias,
+    )
+
+
+def npu_conv_transpose1d(module: nn.ConvTranspose1d, x: torch.Tensor) -> torch.Tensor:
+    """``module(x)``, in chunks on NPU when the input is too wide."""
+    if not _npu_too_wide(x, x.shape[-1]):
+        return module(x)
+    if module.dilation[0] != 1 or module.output_padding[0] != 0:
+        raise NotImplementedError("dilated or output-padded transposed convolution")
+    out = _npu_chunked_conv_transpose1d(
+        x, module.weight, stride=module.stride[0], groups=module.groups
+    )
+    (pad,) = module.padding
+    if pad:
+        out = out[..., pad:-pad]
+    if module.bias is not None:
+        out = out + module.bias.view(1, -1, 1)
     return out
 
 

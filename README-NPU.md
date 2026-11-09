@@ -401,7 +401,7 @@ All three of these tools run on the real model build or at its real shapes:
 | --- | --- |
 | `common/distributed/ops.py` | `get_device_type()` / `get_device_module()` / `get_device()` / `get_process_group_backend()`. The process group backend becomes the composite `cpu:gloo,npu:hccl`. |
 | `projects/minimax_h3/**` | `torch.autocast` regions keyed to the active device type instead of a hardcoded `cuda`, so the fp32 islands survive. |
-| `projects/minimax_h3/modeling/audio_vae/alias_free.py` | Convolutions chunked when their input exceeds CANN's 1,000,000-element width limit. |
+| `projects/minimax_h3/modeling/audio_vae/alias_free.py`, `bigvgan.py` | Convolutions chunked when their input exceeds CANN's 1,000,000-element width limit. |
 | `utils/__init__.py` | Makes `utils` a regular package so `utils.flex_attn` resolves. |
 | `tools/multi_run.sh` | NPU branch: CANN env, `torch_npu` assertion, HCCL timeout, allocator config. conda and `venv/` made optional. |
 | `tools/prepare_venv_npu.sh`, `tools/environment-npu.yaml`, `tools/requirements-npu-inference.txt` | NPU environment build. |
@@ -427,6 +427,13 @@ transposed convolution into chunks when needed. The chunking is exact, not an
 approximation: the forward convolution's chunks are aligned to output indices
 and concatenated, while the transposed convolution's chunks overlap by
 `kernel_size - stride` and are summed.
+
+The next limit is the decoder's last stage, which runs at the full 32 kHz
+rate: its residual-block convolutions and `conv_post` cross 1,000,000 samples
+at about 31 s, and the last upsampling layer at about 62 s. A 40.6 s clip
+failed there (`Conv2DV2 ... [2,8,1,1298400]`). `bigvgan.py` now calls those
+layers through `npu_conv1d` / `npu_conv_transpose1d`, the same chunking with
+dilation, padding and bias handled, and only when the input is too wide.
 
 ## Troubleshooting
 
