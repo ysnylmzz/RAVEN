@@ -86,6 +86,11 @@ sharded.
 5.6 s to 2.7 s. The cost is memory: the peak rose from 36 to 92 GiB per card.
 
 **Check it.** `npu_bench_rtf_8card_950_fsdp.yaml` is the sharded variant.
+Re-measured at SP 8 against the replicated build (adapter fp32 on both sides,
+one session): RTF 7.8 against 3.0, 0.95 s against 0.34 s per forward, peak
+memory 33.9 GiB against 92.0 GiB. Faster compute did not move FSDP's
+per-forward floor, which confirms the all-gather sets it: each card receives
+about 58 GiB of weights per forward, for only ~680 rows of work.
 
 ## Step 3: merge the LoRA and fix the KV cache merge (rollout 43 s → 32 s)
 

@@ -179,6 +179,22 @@ Under FSDP2 every chunk forward all-gathers the whole ~66 GB bf16 DiT trunk
 again, which puts a floor of about 0.9 s under each forward. A 128 GiB card
 holds the trunk outright, so this trial replicates it and keeps only Ulysses SP,
 across all 8 cards.
+
+Measured at SP 8 in one session (`npu_bench_rtf_8card_950_fsdp.yaml` against
+the replicated baseline, adapter in fp32 on both sides):
+
+| DiT placement | RTF | Seconds per clip | Rollout | Per forward | Time to first chunk | Peak memory |
+| --- | --- | --- | --- | --- | --- | --- |
+| Replicated | 3.0 | 24.3 | 18.9 s | 0.34 s | 1.49 s | 92.0 GiB |
+| FSDP2 across 8 cards | 7.8 | 62.1 | 57.0 s | 0.95 s | 5.58 s | 33.9 GiB |
+
+FSDP saves 58 GiB per card and costs 2.6× the wall clock. Its per-forward time
+is the all-gather, not compute: each card receives about 58 GiB of weights per
+forward (7/8 of the bf16 trunk and the fp32 adapter), and the forward's compute
+takes a third of that time. Each card processes only ~680 rows of a chunk
+under SP 8, too few to hide the gather; the same holds for LLM decoding, which
+is why LLM inference engines shard with tensor parallelism instead. Use the
+replicated trial whenever the DiT fits.
 Do not add `models.backbone.placement.fsdp.*` overrides to it: they recreate an
 fsdp node, and the LoRA cast plugin refuses sharded weights.
 
@@ -525,8 +541,9 @@ Use the production trial rather than raising the resolution on
 - 60.4 s has not been generated since the host decode and the BigVGAN
   chunking were added; at that length the last upsampling layer also needs
   chunking, which is in place but unexercised.
-- `npu_bench_rtf_8card_950_fsdp.yaml` has been measured with SP 4 only; it
-  now inherits SP 8 and has not been run that way.
+- Batching several prompts into one forward would share FSDP's all-gather
+  between them and might make FSDP competitive for throughput at a third of
+  the memory. Not measured; validation does not batch prompts that way today.
 - The contiguous KV merge has not been measured on its own. Comparing
   sessions puts it at about 2 s of rollout, which is within thermal drift.
 - FSDP `CPUOffloadPolicy` across multiple ranks is unverified — it needs
