@@ -101,9 +101,31 @@ conda and the venv are optional: the launcher uses whichever Python is on
 
 ## Weights
 
-Download the four MiniMax-H3 components plus the RAVEN LoRA, then point the
-trial at them. The shipped paths are absolute and must be edited — there are
-six of them in
+`tools/download_minimax_h3_weights.sh` fetches everything the streaming trials
+need, about 139 GiB, from two public Hugging Face repos: the FL2VA DiT, text
+encoder, video VAE and tokenizer plus the audio VAE from
+[MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) (MiniMax-H3
+Community License), and the preview LoRA from
+[mvp-lab/MiniMax-H3-RAVEN-Streaming-LoRA](https://huggingface.co/mvp-lab/MiniMax-H3-RAVEN-Streaming-LoRA).
+It checks the free space first, resumes when re-run, and verifies every shard
+at the end.
+
+```sh
+bash tools/download_minimax_h3_weights.sh                 # into /root/models
+bash tools/download_minimax_h3_weights.sh /data/weights   # anywhere else
+HF_ENDPOINT=https://hf-mirror.com bash tools/download_minimax_h3_weights.sh   # through a mirror
+```
+
+Under `/root/models` the shipped trials find the weights without changes.
+Anywhere else, the script writes the six path overrides to
+`<dir>/raven_minimax_h3_overrides.txt`; append them to the launch command:
+
+```sh
+N=8 bash tools/multi_run.sh projects/minimax_h3/trials/npu/npu_8card_950.yaml \
+  $(cat /data/weights/raven_minimax_h3_overrides.txt)
+```
+
+The paths are absolute, and these are the six of them in
 `projects/minimax_h3/trials/base/causal_minimax_h3_base/minimax_h3_raven_streaming_lora_4nfe_preview.yaml`:
 
 | Line | Key | Component |
@@ -115,8 +137,9 @@ six of them in
 | 170 | `path` | Video VAE |
 | 195 | `path` | Audio VAE |
 
-Alternatively override them on the command line without editing the file, as
-`KEY VALUE` pairs — see [Running a trial](README.md#running-a-trial).
+Edit them there, or override them on the command line as `KEY VALUE` pairs
+(see [Running a trial](README.md#running-a-trial)), which is what the
+overrides file does.
 
 **Put the weights on local disk if you can.** Eight ranks reading ~66 GB of
 DiT safetensors off one shared mount is the single largest source of startup
