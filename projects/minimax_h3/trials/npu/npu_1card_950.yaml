@@ -1,0 +1,33 @@
+# Full-resolution inference on one Ascend 950 card (128 GiB). Not yet run.
+#
+# npu_8card_950.yaml without sequence parallelism: the DiT is placed whole
+# with the LoRA adapter unmerged in bf16, and the card carries every head and
+# every row. The text encoder (~49 GiB in bf16) does not fit beside the DiT,
+# so it keeps FSDP on a 1-rank mesh for its CPU offload. That pins host
+# memory, so the container needs --ulimit memlock=-1.
+#
+# Estimated on the card: ~75 GiB static (DiT 64.1, video and audio VAE 10.3)
+# plus ~25 GiB of KV cache and the decode's working memory. Rollout should
+# take roughly eight times as long as on 8 cards.
+#
+# npu_4a_single_card_950.yaml is the shorter 384x672 bring-up check.
+#
+#   ASCEND_RT_VISIBLE_DEVICES=0 N=1 bash tools/multi_run.sh projects/minimax_h3/trials/npu/npu_1card_950.yaml
+__inherit__: npu_8card_950.yaml
+
+validation:
+  num_prompts: 1
+  nrow: 1
+
+distributed:
+  up_size: null
+
+engine:
+  up_size: null
+
+models:
+  text_encoder:
+    placement:
+      fsdp:
+        shard_size: 1
+        cpu_offload: true

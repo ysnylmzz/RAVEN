@@ -1,0 +1,31 @@
+# npu_8card_950.yaml on 2 Ascend 950 cards (128 GiB each). Not yet run.
+#
+# One Ulysses SP group of 2 cards: each card holds 28 of the 56 heads and half
+# of the sequence rows. The DiT stays replicated and the LoRA adapter unmerged
+# in bf16; the text encoder is sharded across the 2 cards.
+#
+# Memory is tight. Estimated per card: ~99 GiB static (DiT 64.1, text encoder
+# 24.7, video and audio VAE 10.3) plus ~13 GiB of KV cache and the decode's
+# working memory, against ~123 GiB usable. If it runs out of memory, offload
+# the text encoder to host memory (it runs once per prompt), which needs the
+# container started with --ulimit memlock=-1:
+#   models.text_encoder.placement.fsdp.cpu_offload true
+# Rollout should take roughly four times as long as on 8 cards.
+#
+#   ASCEND_RT_VISIBLE_DEVICES=0,1 HCCL_NPU_SOCKET_PORT_RANGE=auto \
+#   N=2 bash tools/multi_run.sh projects/minimax_h3/trials/npu/npu_2card_950.yaml
+__inherit__: npu_8card_950.yaml
+
+distributed:
+  up_size: [2]
+
+engine:
+  up_size:
+    train: 2
+    validation: 2
+
+models:
+  text_encoder:
+    placement:
+      fsdp:
+        shard_size: 2

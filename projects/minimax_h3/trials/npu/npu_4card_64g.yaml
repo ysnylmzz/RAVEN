@@ -1,0 +1,32 @@
+# 4-card inference on 64 GiB cards (Ascend 910B). Not yet run.
+#
+# npu_8card_64g.yaml on 4 cards: the DiT and the text encoder are FSDP2-sharded
+# across 4 cards instead of 8, with one Ulysses SP group of 4. The LoRA adapter
+# runs unmerged in fp32.
+#
+# Estimated per card: ~39 GiB static (DiT and adapter 16.6, text encoder 12.4,
+# video and audio VAE 10.3) plus ~6 GiB of KV cache and FSDP's gather buffers.
+# Each card all-gathers 3/4 of the DiT per forward instead of 7/8, against half
+# the cards' compute, so expect it slower than 8 cards but by less than 2x.
+#
+#   ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 HCCL_NPU_SOCKET_PORT_RANGE=auto \
+#   N=4 bash tools/multi_run.sh projects/minimax_h3/trials/npu/npu_4card_64g.yaml
+__inherit__: npu_8card_64g.yaml
+
+distributed:
+  up_size: [4]
+
+engine:
+  up_size:
+    train: 4
+    validation: 4
+
+models:
+  backbone:
+    placement:
+      fsdp:
+        shard_size: 4
+  text_encoder:
+    placement:
+      fsdp:
+        shard_size: 4

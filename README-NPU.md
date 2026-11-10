@@ -157,6 +157,8 @@ models load) and `PYTORCH_NPU_ALLOC_CONF=expandable_segments:True`.
 | `trials/npu/npu_4a_single_card_950.yaml` | 1 | Same, for a 128 GiB card: the DiT is placed whole, with no FSDP and no collectives at all. |
 | `trials/npu/npu_4b_fsdp8_no_sp.yaml` | 8 | FSDP2 across 8 cards with Ulysses SP off. 384×672 — keep it there, see the note below. |
 | `trials/npu/npu_8card_950.yaml` | 8 | **Production on Ascend 950.** The base production trial with one SP group across all 8 cards, the DiT replicated on every card instead of FSDP-sharded, the LoRA adapter unmerged in bf16, and no CPU offload. RTF 2.7: an 8 s clip in 21.5 s. 90 GiB peak per card. |
+| `trials/npu/npu_4card_950.yaml`, `npu_2card_950.yaml`, `npu_1card_950.yaml` | 4, 2, 1 | The production trial on fewer 950 cards. Not yet run; see [Other card counts and card types](#other-card-counts-and-card-types). |
+| `trials/npu/npu_8card_64g.yaml`, `npu_4card_64g.yaml` | 8, 4 | For 64 GiB cards (910B): DiT FSDP-sharded, one SP group. Not yet run on 910B. |
 | `trials/npu/npu_8card_950_sp4.yaml` | 8 | The same with two SP groups of 4, which run two prompts at a time. A single clip takes about twice as long (RTF 4.8). |
 | `trials/base/.../minimax_h3_raven_streaming_lora_4nfe_preview.yaml` | 8 | Base production trial: 768×1376, FSDP2 `shard_size: 8` and SP `up_size: 4`. On a 950 it is slower than the trial above; use it where the DiT does not fit a card. |
 
@@ -244,6 +246,104 @@ with it off is 24.7 GiB per card, so there is ample room.
 > 768×1376 about 14.9 GiB plus fp32 softmax intermediates, which exceeds
 > 120 GiB per card. Use the production trial for full resolution — it has SP
 > enabled.
+
+### Other card counts and card types
+
+Every trial is written for a fixed number of cards. To run on another server,
+pick the trial for its card memory and count from the table below, or adapt
+one using the rules after it. Only the 8-card Ascend 950 rows have been run.
+
+| Card memory | Cards | Trial | DiT placement | Status |
+| --- | --- | --- | --- | --- |
+| 128 GiB (950) | 8 | `npu_8card_950.yaml` | replicated, SP 8 | measured: RTF 2.7, 89.7 GiB peak |
+| 128 GiB | 16 (2 nodes × 8) | `npu_8card_950.yaml`, unchanged | replicated, two SP groups of 8 | not run |
+| 128 GiB | 4 | `npu_4card_950.yaml` | replicated, SP 4 | not run; ~87 GiB static |
+| 128 GiB | 2 | `npu_2card_950.yaml` | replicated, SP 2 | not run; ~99 GiB static, tight |
+| 128 GiB | 1 | `npu_1card_950.yaml` | whole, no SP; text encoder offloaded to host | not run; ~75 GiB static |
+| 64 GiB (910B) | 8 | `npu_8card_64g.yaml` | FSDP across 8, SP 8 | same placement measured on 950: RTF 7.8, 33.9 GiB peak |
+| 64 GiB | 4 | `npu_4card_64g.yaml` | FSDP across 4, SP 4 | not run; ~39 GiB static |
+| 64 GiB | 1 | `npu_4a_single_card.yaml` | FSDP on one card with CPU offload, 384×672 | smoke test only; no full-resolution trial for 1–2 cards |
+
+Each trial's header gives its memory estimate and the command to run it.
+
+**The rules a trial has to satisfy:**
+
+- **SP size is 1, 2, 4 or 8.** Ulysses SP splits the 56 attention heads, and
+  the packed sequence is aligned to 64 rows without padding, so the size must
+  divide both. 16 is not possible; on 16 cards use two groups of 8.
+- **Set the SP size in three places at once:** `distributed.up_size` (a list),
+  `engine.up_size.train` and `engine.up_size.validation`. `null` everywhere
+  turns SP off.
+- **The world size is a multiple of the SP size.** Consecutive ranks form a
+  group, and each group generates its own clip, so 16 ranks with SP 8 make two
+  clips at a time. Keep a group inside one node: SP exchanges data in every
+  attention layer.
+- **FSDP `shard_size` divides the world size.** The production trials shard
+  the text encoder with `shard_size: 8`, so they fail on fewer cards with
+  `shard_size 8 must divide world size 4`. The 4-, 2- and 1-card trials set it
+  to the card count. A `shard_size` smaller than the world shards within
+  groups of that size and replicates across them.
+- **Replicate the DiT only where it fits.** The DiT and its bf16 adapter take
+  64.1 GiB on every card, the two VAEs another 10.3 GiB. That needs a 128 GiB
+  card. On 64 GiB cards the DiT has to be FSDP-sharded, which costs about 2.6×
+  the time (see the FSDP comparison above).
+
+**Estimating memory per card.** Static memory is what the models take:
+
+| Component | Replicated | FSDP-sharded across *n* cards |
+| --- | --- | --- |
+| DiT, bf16 | 61.7 GiB | 61.7 / *n* GiB |
+| LoRA adapter | 2.4 GiB (bf16) | 4.7 / *n* GiB (fp32) |
+| Text encoder, bf16 | — | 49.4 / *n* GiB, or ~0 offloaded to host |
+| Video VAE, fp32 | 9.7 GiB | 9.7 GiB |
+| Audio VAE, fp32 | 0.6 GiB | 0.6 GiB |
+
+During the rollout, add the KV cache: about 25 GiB divided by the SP size
+(3.2 GiB at SP 8, 25 GiB without SP), constant at any video length. Decoding
+adds a few GiB more; clips too long to decode on the card go to host memory
+on their own. Leave a few GiB for HCCL and CANN as well: a 128 GiB card shows
+about 123 GiB to PyTorch.
+
+**16 cards on two nodes.** The launcher takes the usual torchrun variables.
+Run the same command on both nodes, with the weights and the repository at the
+same paths on each:
+
+```sh
+# on node 0 (node 1: NODE_RANK=1, its own LOCAL_ADDR)
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 HCCL_NPU_SOCKET_PORT_RANGE=auto \
+NNODES=2 NODE_RANK=0 MASTER_ADDR=<node 0 IP> MASTER_PORT=7890 \
+LOCAL_ADDR=<this node's IP> \
+N=8 bash tools/multi_run.sh projects/minimax_h3/trials/npu/npu_8card_950.yaml
+```
+
+Set `LOCAL_ADDR` explicitly: inside a container the hostname often resolves to
+127.0.0.1, which the other node cannot reach. If HCCL picks the wrong network
+interface, name it with `HCCL_SOCKET_IFNAME`. This setup has not been run.
+
+**Other Ascend cards.** Check three things before the first run: the memory
+`npu-smi info` reports per card, the count `torch.npu.device_count()` returns
+(it counts both dies of a dual-die card, and each die is a rank), and whether
+`torch_npu.npu_fusion_attention` exists in the installed `torch_npu`. Without
+it the rollout falls back to SDPA, which is much slower and needs far more
+memory; `RAVEN_NPU_FUSED_ATTN=0` reproduces that path on a card that has it.
+
+**Bringing up a new setup.** Go from cheap to expensive, so a failure is easy
+to place:
+
+1. `npu-smi info` shows the cards idle, and
+   `python -m projects.minimax_h3.tools.check_autocast --dtype float16` passes.
+2. The chosen trial with `validation.num_prompts 1`: one 8 s clip. Check it
+   finishes and the video looks right.
+3. The RTF benchmark for speed. Any trial becomes a benchmark by swapping its
+   engine; the `benchmark.*` settings are optional (1 warmup, 3 iterations):
+
+   ```sh
+   N=4 bash tools/multi_run.sh projects/minimax_h3/trials/npu/npu_4card_950.yaml \
+     entry.module projects.minimax_h3.tools.benchmark_rtf \
+     entry.class_name RTFBenchmarkEngine validation.num_prompts 1
+   ```
+4. A clip longer than 8 s (see
+   [Picking frames, resolution, and `max_seqlen`](#picking-frames-resolution-and-max_seqlen)).
 
 ### Output
 
@@ -541,6 +641,9 @@ Use the production trial rather than raising the resolution on
 - 60.4 s has not been generated since the host decode and the BigVGAN
   chunking were added; at that length the last upsampling layer also needs
   chunking, which is in place but unexercised.
+- The 4-, 2- and 1-card 950 trials, the 64 GiB trials and the two-node setup
+  have not been run. Their memory figures are estimates from the measured
+  8-card build.
 - Batching several prompts into one forward would share FSDP's all-gather
   between them and might make FSDP competitive for throughput at a third of
   the memory. Not measured; validation does not batch prompts that way today.

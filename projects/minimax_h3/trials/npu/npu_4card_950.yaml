@@ -1,0 +1,28 @@
+# npu_8card_950.yaml on 4 Ascend 950 cards (128 GiB each). Not yet run.
+#
+# One Ulysses SP group of 4 cards: each card holds 14 of the 56 heads and a
+# quarter of the sequence rows. The DiT stays replicated and the LoRA adapter
+# unmerged in bf16; the text encoder is sharded across the 4 cards instead
+# of 8.
+#
+# Estimated per card: ~87 GiB static (DiT 64.1, text encoder 12.4, video and
+# audio VAE 10.3) plus ~6 GiB of KV cache and the decode's working memory.
+# Rollout should take roughly twice as long as on 8 cards.
+#
+#   ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 HCCL_NPU_SOCKET_PORT_RANGE=auto \
+#   N=4 bash tools/multi_run.sh projects/minimax_h3/trials/npu/npu_4card_950.yaml
+__inherit__: npu_8card_950.yaml
+
+distributed:
+  up_size: [4]
+
+engine:
+  up_size:
+    train: 4
+    validation: 4
+
+models:
+  text_encoder:
+    placement:
+      fsdp:
+        shard_size: 4
