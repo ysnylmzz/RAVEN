@@ -111,7 +111,7 @@ every projection, so the 1.26 B adapter parameters cost a quarter of each
 forward. A placement plugin (`common/plugin/lora_merge.py`, commit `734534a`)
 folds `W + scaling·B·A` into the base weights once, in fp32, rounds to bf16 and
 removes the adapter layers. The result differs from the unmerged path only by
-bf16 rounding: on a test layer, merged and unmerged outputs agree to cosine
+bf16 rounding (but see the withdrawal below): on a test layer, merged and unmerged outputs agree to cosine
 0.99999, and the merged one is as close to an fp32 reference as the unmerged
 one. It refuses FSDP-sharded weights and models in training mode.
 
@@ -258,6 +258,6 @@ Rollout is 76% of a clip, at about 0.30 s per forward on 8 cards.
 | `npu-rollout-opt` | `de303e0` KV merge, `734534a` LoRA merge plugin, `3ce8ca2` replicated 950 trial | 2, 3 |
 | `npu-parallel-decode` | `d880595` group decode, `a0fc46d` and `89bae55` measurements | 4 |
 | `npu-sp8` | `352a523` SP 8 trials, `5e88bef` SP 8 as the default | 5 |
-| `npu-long-video` | `cd52633` host-memory decode, `2966203` BigVGAN conv chunking, `4ced83e` merge withdrawn and bf16 adapter added, then bf16 adapter as the default | long clips, step 3 replacement |
+| `npu-long-video` | `cd52633` host-memory decode, `2966203` BigVGAN conv chunking, `4ced83e` merge withdrawn and bf16 adapter added, `3bcc396` bf16 adapter as the default, `6d6e481` clean 40.6 s clip, `dd3a135` FSDP re-measured at SP 8 | long clips, step 3 replacement, step 2 check |
 
 Each branch builds on the one above it, so `npu-long-video` contains everything.
